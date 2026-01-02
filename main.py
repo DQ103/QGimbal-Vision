@@ -22,7 +22,6 @@ DEFAULT_CAMERA = 1  # 摄像头索引（默认 0）
 DEFAULT_WIDTH = 640  # 期望宽度
 DEFAULT_HEIGHT = 480  # 期望高度
 DEFAULT_FPS = 120  # 期望帧率
-DEFAULT_MIN_SCORE = 0.3  # 最低接受分数，低于则认为没有可靠矩形
 
 
 def parse_args():
@@ -62,21 +61,17 @@ def detect_rectangles(frame, min_area_ratio=0.005, max_area_ratio=0.5, angle_tol
     # 大津法二值化
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 将中位数强制为 float（静态分析更稳健），基于中位数自动计算 Canny 阈值
-    v = float(np.median(blurred))
-    sigma = 0.4
-    lower = int(max(0.0, (1.0 - sigma) * v))
-    upper = int(min(255.0, (1.0 + sigma) * v))
-    edges = cv2.Canny(blurred, lower, upper)
-
     # 形态学核
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
-    closed = cv2.dilate(closed, kernel, iterations=1)
+    opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    opened = cv2.erode(opened, kernel, iterations=1)
+
+    # 边缘检测
+    edges = cv2.Canny(opened, 25, 75)
 
     # 查找轮廓
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     rects = []
 
