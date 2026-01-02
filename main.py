@@ -13,12 +13,16 @@
 import argparse
 import time
 import sys
+import math
+
 import cv2
+import numpy as np
 
 DEFAULT_CAMERA = 1  # 摄像头索引（默认 0）
 DEFAULT_WIDTH = 640  # 期望宽度
 DEFAULT_HEIGHT = 480  # 期望高度
 DEFAULT_FPS = 120  # 期望帧率
+DEFAULT_MIN_SCORE = 0.3  # 最低接受分数，低于则认为没有可靠矩形
 
 
 def parse_args():
@@ -26,6 +30,99 @@ def parse_args():
     p.add_argument('--camera', type=int, default=DEFAULT_CAMERA, help=f'摄像头索引（默认 {DEFAULT_CAMERA}）')
     p.add_argument('--fps', type=int, choices=[0, 1], default=1, help='是否在画面上显示 FPS（0/1）')
     return p.parse_args()
+
+
+def angle_between(v1, v2):
+    # 计算两向量之间的夹角（度数）
+    dot = v1.dot(v2)
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 * n2 == 0:
+        return 0.0
+    cos = max(-1.0, min(1.0, dot / (n1 * n2)))
+    return math.degrees(math.acos(cos))
+
+
+def detect_rectangles(frame, min_area_ratio=0.005, max_area_ratio=0.5, angle_tol=25.0):
+    """
+    在输入 BGR 图像中检测矩形（包括旋转矩形）。返回矩形的 box points 和相关信息。
+    - min_area_ratio: 与图像面积的最小比率（过小的轮廓会被丢弃）
+    - angle_tol: 角度容忍度（判断为矩形时，四个角接近 90 度的容差）
+    """
+    h, w = frame.shape[:2]
+    img_area = h * w
+    min_area = img_area * min_area_ratio
+    max_area = img_area * max_area_ratio
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # 高斯模糊
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # 大津法二值化
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 将中位数强制为 float（静态分析更稳健），基于中位数自动计算 Canny 阈值
+    v = float(np.median(blurred))
+    sigma = 0.4
+    lower = int(max(0.0, (1.0 - sigma) * v))
+    upper = int(min(255.0, (1.0 + sigma) * v))
+    edges = cv2.Canny(blurred, lower, upper)
+
+    # 形态学核
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+    closed = cv2.dilate(closed, kernel, iterations=1)
+
+    # 查找轮廓
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rects = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        # 尝试多边形逼近
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            pts = approx.reshape(4, 2).astype(np.float32)
+
+            # 验证角度接近直角
+            angles = []
+            for i in range(4):
+                p0 = pts[i]
+                p1 = pts[(i + 1) % 4]
+                p2 = pts[(i + 2) % 4]
+                angles.append(angle_between(p0 - p1, p2 - p1))
+            # 确保每个角都在容差范围内或矩形足够规则
+            if all(abs(a - 90) < angle_tol for a in angles):
+                # 计算最短边与最长边比率，确保不是过于扭曲的矩形
+                dists = [np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]
+                min_dist = min(dists)
+                max_dist = max(dists)
+                if max_dist / min_dist > 3:
+                    continue
+                rects.append({'center': tuple(np.mean(pts, axis=0)), 'box': pts, 'area': area})
+    # 按面积降序返回（优先较大的矩形）
+    rects = sorted(rects, key=lambda r: r['area'], reverse=True)
+    return rects
+
+
+def draw_detected_rect(frame, r):
+    """在图像上绘制单个检测到的矩形并标注信息（如果 r 为 None 则不绘制）。"""
+    if r is None:
+        return
+    box = r['box'].astype(np.int32)
+    cv2.polylines(frame, [box], isClosed=True, color=(0, 255, 0), thickness=3)
+    (cx, cy) = r['center']
+    label = f"A:{int(r['area'])}"
+    cv2.putText(frame, label, (int(cx) - 80, int(cy) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
 
 
 def main():
@@ -56,6 +153,11 @@ def main():
                 continue
 
             frame = cv2.flip(frame, -1)
+
+            # 对每帧执行矩形检测
+            rects = detect_rectangles(frame, min_area_ratio=0.005, max_area_ratio=0.5, angle_tol=25.0)
+            if rects:
+                draw_detected_rect(frame, rects[0])
 
             # 计算 FPS（指数移动平均以平滑显示）
             if args.fps:
