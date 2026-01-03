@@ -16,10 +16,10 @@ GUI 模式按 'q' 或 ESC 退出；无窗口模式请按 Ctrl+C 退出。
 import argparse
 import time
 import sys
-import math
 
 import cv2
-import numpy as np
+
+from vision.rect_detect import detect_rectangles, draw_detected_rect
 
 DEFAULT_CAMERA = 1  # 摄像头索引（默认 0）
 DEFAULT_WIDTH = 640  # 期望宽度
@@ -37,97 +37,6 @@ def parse_args():
     p.add_argument('--print-interval', type=float, default=DEFAULT_PRINT_INTERVAL,
                    help=f'终端输出间隔秒数（仅 --display 0 生效，默认 {DEFAULT_PRINT_INTERVAL}）')
     return p.parse_args()
-
-
-def angle_between(v1, v2):
-    # 计算两向量之间的夹角（度数）
-    dot = v1.dot(v2)
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    if n1 * n2 == 0:
-        return 0.0
-    cos = max(-1.0, min(1.0, dot / (n1 * n2)))
-    return math.degrees(math.acos(cos))
-
-
-def detect_rectangles(frame, min_area_ratio=0.005, max_area_ratio=0.5, angle_tol=25.0):
-    """
-    在输入 BGR 图像中检测矩形（包括旋转矩形）。返回矩形的 box points 和相关信息。
-    - min_area_ratio: 与图像面积的最小比率（过小的轮廓会被丢弃）
-    - angle_tol: 角度容忍度（判断为矩形时，四个角接近 90 度的容差）
-    """
-    h, w = frame.shape[:2]
-    img_area = h * w
-    min_area = img_area * min_area_ratio
-    max_area = img_area * max_area_ratio
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # 高斯模糊
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    # 大津法二值化
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 形态学核
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-
-    opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-    opened = cv2.erode(opened, kernel, iterations=1)
-
-    # 边缘检测
-    edges = cv2.Canny(opened, 25, 75)
-
-    # 查找轮廓
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    rects = []
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
-            continue
-
-        # 尝试多边形逼近
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            pts = approx.reshape(4, 2).astype(np.float32)
-
-            # 验证角度接近直角
-            angles = []
-            for i in range(4):
-                p0 = pts[i]
-                p1 = pts[(i + 1) % 4]
-                p2 = pts[(i + 2) % 4]
-                angles.append(angle_between(p0 - p1, p2 - p1))
-            # 确保每个角都在容差范围内或矩形足够规则
-            if all(abs(a - 90) < angle_tol for a in angles):
-                # 计算最短边与最长边比率，确保不是过于扭曲的矩形
-                dists = [np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]
-                min_dist = min(dists)
-                max_dist = max(dists)
-                if max_dist / min_dist > 3:
-                    continue
-                rects.append({'center': tuple(np.mean(pts, axis=0)), 'box': pts, 'area': area})
-    # 按面积降序返回（优先较大的矩形）
-    rects = sorted(rects, key=lambda r: r['area'], reverse=True)
-    return rects
-
-
-def draw_detected_rect(frame, r):
-    """在图像上绘制单个检测到的矩形并标注信息（如果 r 为 None 则不绘制）。"""
-    if r is None:
-        return
-    box = r['box'].astype(np.int32)
-    cv2.polylines(frame, [box], isClosed=True, color=(0, 255, 0), thickness=3)
-    (cx, cy) = r['center']
-    label = f"A:{int(r['area'])}"
-    label_coord = f"X:{int(cx)} Y:{int(cy)}"
-    cv2.putText(frame, label, (int(cx) - 80, int(cy) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    cv2.putText(frame, label_coord, (int(cx) - 80, int(cy) + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    cv2.circle(frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
 
 
 def main():
@@ -193,8 +102,8 @@ def main():
                     if best is None:
                         print(f"fps={fps:.1f} rect=none")
                     else:
-                        cx, cy = best['center']
-                        area = best['area']
+                        cx, cy = best.center
+                        area = best.area
                         print(f"fps={fps:.1f} cx={cx:.1f} cy={cy:.1f} area={area:.0f}")
 
     except KeyboardInterrupt:
