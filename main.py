@@ -35,8 +35,8 @@ DEFAULT_PRINT_INTERVAL = 0.05
 # 控制默认参数（可通过命令行覆盖）
 DEFAULT_CONTROL_ENABLED = 1
 DEFAULT_MAX_RPM = 20.0
-DEFAULT_DEADBAND_PX = 6.0
-DEFAULT_LOST_TIMEOUT_S = 0.25
+DEFAULT_DEADBAND_PX = 0.0
+DEFAULT_LOST_TIMEOUT_S = 0.4
 
 
 def parse_args():
@@ -126,8 +126,9 @@ def main():
             # PID 控制：将目标中心追踪到屏幕中心，输出 yaw/pitch rpm
             h, w = frame.shape[:2]
             target_center = best.center if best is not None else None
-            ctrl_out = tracker.update(frame_w=w, frame_h=h, target_center=target_center, dt=max(dt, 1e-6), now=now)
-            serial.send_rpm(ctrl_out.yaw_rpm, ctrl_out.pitch_rpm)
+            ret, ctrl_out = tracker.update(frame_w=w, frame_h=h, target_center=target_center, dt=max(dt, 1e-6), now=now)
+            if ret:
+                serial.send_rpm(ctrl_out.yaw_rpm, ctrl_out.pitch_rpm)
 
             if display:
                 if best is not None:

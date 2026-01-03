@@ -69,19 +69,15 @@ class GimbalSerialStub:
     def build_packet(self, yaw_rpm: float, pitch_rpm: float) -> bytes:
         """Build a binary packet matching `ReceivePackage` (little-endian)."""
         header = struct.pack(
-            "<BBBBff",
+            "<ffBBB",
+            float(yaw_rpm),
+            float(pitch_rpm),
             int(self.laser_enabled) & 0xFF,
             int(self.enabled) & 0xFF,
             int(self.stability_enabled) & 0xFF,
-            int(0) & 0xFF,  # 4字节对齐用
-            float(yaw_rpm),
-            float(pitch_rpm),
         )
         chk = _checksum_mod_256(header)
         pkt = header + struct.pack("<B", chk)
-        pad_len = (-len(pkt)) % 8
-        if pad_len:
-            pkt += b"\x00" * pad_len
         return pkt
 
     def send_rpm(self, yaw_rpm: float, pitch_rpm: float) -> None:

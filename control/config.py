@@ -45,8 +45,8 @@ class ControlConfig:
 
     # PID per axis. Input is normalized error (err_px / (w/2 or h/2)).
     yaw_pid: PIDConfig = field(
-        default_factory=lambda: PIDConfig(kp=5.0, ki=0.00, kd=0.1, integral_limit=0.6, output_limit=1.0)
+        default_factory=lambda: PIDConfig(kp=4.0, ki=0.80, kd=0.08, integral_limit=0.2, output_limit=1.0)
     )
     pitch_pid: PIDConfig = field(
-        default_factory=lambda: PIDConfig(kp=5.0, ki=0.00, kd=0.1, integral_limit=0.6, output_limit=1.0)
+        default_factory=lambda: PIDConfig(kp=3.0, ki=0.6, kd=0.06, integral_limit=0.2, output_limit=1.0)
     )

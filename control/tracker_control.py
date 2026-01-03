@@ -43,7 +43,7 @@ class GimbalTracker:
         target_center: Tuple[float, float] | None,
         dt: float,
         now: float | None = None,
-    ) -> ControlOutput:
+    ) -> tuple[bool, ControlOutput]:
         """Compute RPM commands.
 
         Args:
@@ -56,15 +56,15 @@ class GimbalTracker:
             now = time.time()
 
         if not self.cfg.enabled:
-            return ControlOutput(0.0, 0.0, 0.0, 0.0)
+            return False,ControlOutput(0.0, 0.0, 0.0, 0.0)
 
         # Lost target handling
         if target_center is None:
             if self._last_seen_ts > 0 and (now - self._last_seen_ts) <= self.cfg.lost_timeout_s:
                 # within grace period: keep trying with zero error (hold still).
-                return ControlOutput(0.0, 0.0, 0.0, 0.0)
+                return False,ControlOutput(0.0, 0.0, 0.0, 0.0)
             self.reset()
-            return ControlOutput(0.0, 0.0, 0.0, 0.0)
+            return True,ControlOutput(0.0, 0.0, 0.0, 0.0)
 
         self._last_seen_ts = now
 
@@ -92,7 +92,7 @@ class GimbalTracker:
         if self.cfg.invert_pitch:
             pitch_rpm = -pitch_rpm
 
-        return ControlOutput(yaw_rpm, pitch_rpm, err_x_px, err_y_px)
+        return True,ControlOutput(yaw_rpm, pitch_rpm, err_x_px, err_y_px)
 
 
 def _pid_from_cfg(cfg: PIDConfig) -> PID:
