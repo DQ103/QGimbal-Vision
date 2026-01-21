@@ -25,7 +25,7 @@ from control.config import ControlConfig
 from control.serial_stub import GimbalSerialStub
 from control.tracker_control import GimbalTracker
 
-DEFAULT_CAMERA = 1  # 摄像头索引（默认 0）
+DEFAULT_CAMERA = 0  # 摄像头索引（默认 0）
 DEFAULT_WIDTH = 640  # 期望宽度
 DEFAULT_HEIGHT = 480  # 期望高度
 DEFAULT_FPS = 120  # 期望帧率
@@ -59,7 +59,7 @@ def parse_args():
 
     # 串口相关（协议在 control/serial_stub.py 内实现）
     p.add_argument('--serial-port', type=str, default=None, help='串口端口号，例如 COM3；不填则不发送')
-    p.add_argument('--serial-baud', type=int, default=115200, help='串口波特率（默认 115200）')
+    p.add_argument('--serial-baud', type=int, default=1152000, help='串口波特率（默认 1152000）')
 
     return p.parse_args()
 
