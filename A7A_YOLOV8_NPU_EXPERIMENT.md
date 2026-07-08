@@ -1,7 +1,7 @@
 # A7A YOLOv8 NPU Experiment
 
 This branch keeps the stable rectangle detector and adds an experimental
-Allwinner/Radxa YOLOv8 NPU path.
+Allwinner/Radxa YOLO NPU path.
 
 References:
 
@@ -12,17 +12,63 @@ References:
 
 - Host archive extracted at:
   `/home/aki/cv/awnpu_model_zoo-v1.0.0-20260423-f562dd16`
+- Host v0.9 archive extracted at:
+  `/home/aki/cv/awnpu_model_zoo-v0.9.0-20260116-83a67d4b`
 - Board model zoo subset synced to:
   `/home/radxa/awnpu_model_zoo`
+- Board v0.9 model zoo subset synced to:
+  `/home/radxa/awnpu_model_zoo_v0.9`
 - Board official demo built at:
   `/home/radxa/awnpu_model_zoo/examples/yolov8/build_native/yolov8_demo_a733`
+- Board YOLOv5 official demo built at:
+  `/home/radxa/awnpu_model_zoo_v0.9/examples/yolov5/build_native/yolov5_demo_a733`
 - Board VIPLite runtime path:
   `/home/radxa/awnpu_model_zoo/common/npuruntime/lib_linux_aarch64/A733`
+- Board v0.9 VIPLite runtime path:
+  `/home/radxa/awnpu_model_zoo_v0.9/common/npuruntime/lib_linux_aarch64/A733`
 - Missing artifact:
   `examples/yolov8/model/yolov8n_6_uint8_a733.nb`
 
-The `.nb` file is not included in the downloaded model zoo archive. It must be
-generated with the A733 NPU conversion container.
+The YOLOv8 `.nb` file is not included in the downloaded model zoo archive. It
+must be generated with the A733 NPU conversion container.
+
+The older `allwinner-model-zoo.tar.gz` v0.9 archive does include an A733 YOLOv5
+model:
+
+```text
+examples/yolov5/model/yolov5s_rt_uint8_a733.nb
+```
+
+This is the fastest current path for proving the NPU call chain.
+
+## Quick NPU Smoke Test With Included YOLOv5
+
+The v0.9 model zoo includes the A733 YOLOv5 model, so no conversion container is
+needed for this test.
+
+On the board:
+
+```bash
+cd /tmp/QGimbal-Vision-p4-test
+scripts/build_allwinner_yolov5_demo_native.sh /home/radxa/awnpu_model_zoo_v0.9
+export LD_LIBRARY_PATH=/home/radxa/awnpu_model_zoo_v0.9/common/npuruntime/lib_linux_aarch64/A733:$LD_LIBRARY_PATH
+cd /home/radxa/awnpu_model_zoo_v0.9/examples/yolov5/build_native
+./yolov5_demo_a733 -nb ../model/yolov5s_rt_uint8_a733.nb -i ../model/dog.jpg
+```
+
+Observed on A7A:
+
+```text
+VIPLite driver software version 2.0.3.2-AW-2024-08-30
+run time for this network 0: 23992 us.
+detection num: 3
+16:  91%, [ 135,  221,  311,  535], dog
+ 2:  67%, [ 470,   74,  688,  173], car
+ 1:  61%, [ 155,  118,  573,  424], bicycle
+```
+
+This proves `/dev/vipcore`, VIPLite, the A733 `.nb` model, and the board-side
+NPU runtime are working.
 
 ## Generate The A733 Model
 
@@ -87,7 +133,7 @@ python3 -u main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
   --capture-mode raw --awisp 0 --largemode 0 --detect-scale 0.25 \
   --detector hybrid --yolo-scale 0.33 --yolo-every 30 \
   --yolo-timeout 3.0 --yolo-min-confidence 0.4 \
-  --yolo-command "python3 scripts/yolo_json_worker_cli_adapter.py --parser allwinner-yolov8 --timeout 3.0 --command \"env LD_LIBRARY_PATH=/home/radxa/awnpu_model_zoo/common/npuruntime/lib_linux_aarch64/A733 /home/radxa/awnpu_model_zoo/examples/yolov8/build_native/yolov8_demo_a733 -nb /home/radxa/awnpu_model_zoo/examples/yolov8/model/yolov8n_6_uint8_a733.nb -i {image}\"" \
+  --yolo-command "python3 scripts/yolo_json_worker_cli_adapter.py --parser allwinner-yolo --timeout 3.0 --command \"env LD_LIBRARY_PATH=/home/radxa/awnpu_model_zoo/common/npuruntime/lib_linux_aarch64/A733 /home/radxa/awnpu_model_zoo/examples/yolov8/build_native/yolov8_demo_a733 -nb /home/radxa/awnpu_model_zoo/examples/yolov8/model/yolov8n_6_uint8_a733.nb -i {image}\"" \
   --display-mode color --stream-port 8080 --stream-scale 0.33 \
   --stream-every 8 --stream-quality 65 --print-interval 1
 ```

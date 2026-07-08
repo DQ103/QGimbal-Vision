@@ -10,7 +10,7 @@ Expected external stdout:
 or:
   [{"bbox":[x1,y1,x2,y2],"confidence":0.9,"label":"target"}]
 
-With --parser allwinner-yolov8 it also accepts Allwinner/Radxa demo output:
+With --parser allwinner-yolo it also accepts Allwinner/Radxa demo output:
   16:  95%, [ 131,  220,  308,  541], dog
 """
 
@@ -36,7 +36,7 @@ def parse_args():
     )
     parser.add_argument(
         "--parser",
-        choices=("auto", "json", "allwinner-yolov8"),
+        choices=("auto", "json", "allwinner-yolo", "allwinner-yolov8"),
         default="auto",
         help="external output parser, default auto",
     )
@@ -102,7 +102,7 @@ def normalize_response(stdout: str, stderr: str, frame_id, parser: str):
             if parser == "json":
                 raise
 
-    if not detections and parser in ("auto", "allwinner-yolov8"):
+    if not detections and parser in ("auto", "allwinner-yolo", "allwinner-yolov8"):
         detections = parse_allwinner_yolov8_response(text)
 
     return {"frame_id": frame_id, "detections": detections}

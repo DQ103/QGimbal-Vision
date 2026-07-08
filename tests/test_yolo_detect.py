@@ -107,7 +107,7 @@ detection num: 3
  2:  68%, [ 467,   74,  695,  171], car
 """
 
-    response = normalize_response("", stderr, frame_id=8, parser="allwinner-yolov8")
+    response = normalize_response("", stderr, frame_id=8, parser="allwinner-yolo")
 
     assert response["frame_id"] == 8
     assert response["detections"][0] == {
