@@ -138,6 +138,7 @@ http://192.168.0.98:8080/
 python3 main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
   --capture-mode raw --awisp 0 --detect-scale 0.25 \
   --detector hybrid --yolo-scale 0.33 \
+  --yolo-every 8 \
   --yolo-command "python3 scripts/yolo_json_worker_stub.py"
 ```
 

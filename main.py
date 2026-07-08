@@ -60,6 +60,7 @@ DEFAULT_RECT_MAX_ASPECT = 5.0
 DEFAULT_RECT_MAX_AREA_RATIO = 0.5
 DEFAULT_DETECTOR = "rect"
 DEFAULT_YOLO_SCALE = 0.33
+DEFAULT_YOLO_EVERY = 1
 DEFAULT_YOLO_TIMEOUT = 0.05
 DEFAULT_YOLO_MIN_CONFIDENCE = 0.25
 DEFAULT_YOLO_JPEG_QUALITY = 70
@@ -214,6 +215,8 @@ def parse_args():
                    help='外部 YOLO/NPU worker 命令；--detector yolo/hybrid 时必填')
     p.add_argument('--yolo-scale', type=float, default=DEFAULT_YOLO_SCALE,
                    help=f'送入 YOLO worker 的缩放比例（默认 {DEFAULT_YOLO_SCALE}）')
+    p.add_argument('--yolo-every', type=int, default=DEFAULT_YOLO_EVERY,
+                   help=f'每 N 帧调用一次 YOLO worker（默认 {DEFAULT_YOLO_EVERY}）')
     p.add_argument('--yolo-timeout', type=float, default=DEFAULT_YOLO_TIMEOUT,
                    help=f'等待 YOLO worker 输出的超时时间秒（默认 {DEFAULT_YOLO_TIMEOUT}）')
     p.add_argument('--yolo-min-confidence', type=float, default=DEFAULT_YOLO_MIN_CONFIDENCE,
@@ -1068,15 +1071,18 @@ def detect_candidates(
     width: int,
     height: int,
     yolo_detector: Optional[YoloSubprocessDetector],
+    frame_index: int,
 ):
     detector = args.detector
     if detector in ('yolo', 'hybrid') and yolo_detector is not None:
-        yolo_frame = make_display_frame(raw_frame, detect_frame, width, height, args, float(args.yolo_scale))
-        yolo_rects = yolo_detector.detect(yolo_frame)
-        if yolo_rects:
-            frame_h, frame_w = detect_frame.shape[:2]
-            yolo_h, yolo_w = yolo_frame.shape[:2]
-            return scale_detected_rects(yolo_rects, frame_w / yolo_w, frame_h / yolo_h)
+        should_run_yolo = frame_index % int(args.yolo_every) == 0
+        if should_run_yolo:
+            yolo_frame = make_display_frame(raw_frame, detect_frame, width, height, args, float(args.yolo_scale))
+            yolo_rects = yolo_detector.detect(yolo_frame)
+            if yolo_rects:
+                frame_h, frame_w = detect_frame.shape[:2]
+                yolo_h, yolo_w = yolo_frame.shape[:2]
+                return scale_detected_rects(yolo_rects, frame_w / yolo_w, frame_h / yolo_h)
         if detector == 'yolo':
             return []
 
@@ -1108,6 +1114,8 @@ def main():
         raise SystemExit('--detect-scale 必须在 0 到 1 之间')
     if not 0.0 < args.yolo_scale <= 1.0:
         raise SystemExit('--yolo-scale 必须在 0 到 1 之间')
+    if args.yolo_every < 1:
+        raise SystemExit('--yolo-every 必须大于等于 1')
     if args.detector in ('yolo', 'hybrid') and not args.yolo_command:
         raise SystemExit('--detector yolo/hybrid 需要提供 --yolo-command')
     if args.yolo_timeout <= 0.0:
@@ -1200,7 +1208,7 @@ def main():
             detect_frame = extract_frame(frame, width, height, args)
 
             # 对每帧执行矩形检测
-            rects = detect_candidates(args, frame, detect_frame, width, height, yolo_detector)
+            rects = detect_candidates(args, frame, detect_frame, width, height, yolo_detector, frame_index)
             h, w = detect_frame.shape[:2]
             best = rect_selector.update(rects, w, h)
 
