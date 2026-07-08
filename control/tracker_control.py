@@ -14,7 +14,7 @@ def _apply_deadband(err_px: float, deadband_px: float) -> float:
     return err_px
 
 
-@dataclass(slots=True)
+@dataclass
 class ControlOutput:
     yaw_rpm: float
     pitch_rpm: float
@@ -103,4 +103,3 @@ def _pid_from_cfg(cfg: PIDConfig) -> PID:
         integral_limit=cfg.integral_limit,
         output_limit=cfg.output_limit,
     )
-

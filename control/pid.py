@@ -7,7 +7,7 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
-@dataclass(slots=True)
+@dataclass
 class PID:
     """A small PID controller.
 
@@ -59,4 +59,3 @@ class PID:
 
         out = p + i + d
         return _clamp(out, -self.output_limit, self.output_limit)
-

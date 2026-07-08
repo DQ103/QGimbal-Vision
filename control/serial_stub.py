@@ -10,7 +10,7 @@ def _checksum_mod_256(payload: bytes) -> int:
     return sum(payload) & 0xFF
 
 
-@dataclass(slots=True)
+@dataclass
 class GimbalSerialStub:
     """Serial sender for STM32 gimbal.
 

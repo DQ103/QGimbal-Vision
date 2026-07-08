@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-@dataclass(slots=True)
+@dataclass
 class PIDConfig:
     """PID parameters.
 
@@ -19,7 +19,7 @@ class PIDConfig:
     output_limit: float = 1.0
 
 
-@dataclass(slots=True)
+@dataclass
 class ControlConfig:
     """High-level control configuration.
 
