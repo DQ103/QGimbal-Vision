@@ -36,6 +36,7 @@ from vision.rect_detect import (
     detect_rectangles_multi_pass,
     draw_detected_rect,
 )
+from vision.yolo_detect import YoloSubprocessDetector
 
 from control.config import ControlConfig
 from control.serial_stub import GimbalSerialStub
@@ -57,6 +58,11 @@ DEFAULT_RECT_CENTER_WEIGHT = 0.25
 DEFAULT_RECT_PREV_WEIGHT = 0.70
 DEFAULT_RECT_MAX_ASPECT = 5.0
 DEFAULT_RECT_MAX_AREA_RATIO = 0.5
+DEFAULT_DETECTOR = "rect"
+DEFAULT_YOLO_SCALE = 0.33
+DEFAULT_YOLO_TIMEOUT = 0.05
+DEFAULT_YOLO_MIN_CONFIDENCE = 0.25
+DEFAULT_YOLO_JPEG_QUALITY = 70
 DEFAULT_FLIP = 0
 DEFAULT_DISPLAY_MODE = "gray"
 DEFAULT_DISPLAY_SCALE = 0.5
@@ -202,6 +208,20 @@ def parse_args():
                    help=f'候选矩形最大长宽比（默认 {DEFAULT_RECT_MAX_ASPECT}）')
     p.add_argument('--rect-max-area-ratio', type=float, default=DEFAULT_RECT_MAX_AREA_RATIO,
                    help=f'候选矩形最大面积占比（默认 {DEFAULT_RECT_MAX_AREA_RATIO}）')
+    p.add_argument('--detector', choices=['rect', 'yolo', 'hybrid'], default=DEFAULT_DETECTOR,
+                   help=f'检测器：rect 传统CV，yolo 外部NPU/YOLO，hybrid YOLO优先传统CV兜底（默认 {DEFAULT_DETECTOR}）')
+    p.add_argument('--yolo-command', type=str, default='',
+                   help='外部 YOLO/NPU worker 命令；--detector yolo/hybrid 时必填')
+    p.add_argument('--yolo-scale', type=float, default=DEFAULT_YOLO_SCALE,
+                   help=f'送入 YOLO worker 的缩放比例（默认 {DEFAULT_YOLO_SCALE}）')
+    p.add_argument('--yolo-timeout', type=float, default=DEFAULT_YOLO_TIMEOUT,
+                   help=f'等待 YOLO worker 输出的超时时间秒（默认 {DEFAULT_YOLO_TIMEOUT}）')
+    p.add_argument('--yolo-min-confidence', type=float, default=DEFAULT_YOLO_MIN_CONFIDENCE,
+                   help=f'YOLO 检测框最低置信度（默认 {DEFAULT_YOLO_MIN_CONFIDENCE}）')
+    p.add_argument('--yolo-jpeg-quality', type=int, default=DEFAULT_YOLO_JPEG_QUALITY,
+                   help=f'传给 YOLO worker 的 JPEG 质量（默认 {DEFAULT_YOLO_JPEG_QUALITY}）')
+    p.add_argument('--yolo-label', action='append', default=[],
+                   help='只接受指定 label，可重复传多次；不传则接受所有类别')
     p.add_argument('--flip', type=int, choices=[0, 1], default=DEFAULT_FLIP,
                    help=f'是否把图像旋转 180 度（0/1，默认 {DEFAULT_FLIP}；开启会降低 FPS）')
     p.add_argument('--display-mode', choices=['gray', 'color'], default=DEFAULT_DISPLAY_MODE,
@@ -397,6 +417,10 @@ def scale_detected_rect(rect, scale_x: float, scale_y: float):
         pass_index=rect.pass_index,
         score=rect.score,
     )
+
+
+def scale_detected_rects(rects, scale_x: float, scale_y: float):
+    return [scale_detected_rect(rect, scale_x, scale_y) for rect in rects]
 
 
 def make_display_frame(raw_frame, detect_frame, width: int, height: int, args, output_scale: float = 1.0):
@@ -1037,6 +1061,33 @@ def detect_with_scale(
     ]
 
 
+def detect_candidates(
+    args,
+    raw_frame,
+    detect_frame,
+    width: int,
+    height: int,
+    yolo_detector: Optional[YoloSubprocessDetector],
+):
+    detector = args.detector
+    if detector in ('yolo', 'hybrid') and yolo_detector is not None:
+        yolo_frame = make_display_frame(raw_frame, detect_frame, width, height, args, float(args.yolo_scale))
+        yolo_rects = yolo_detector.detect(yolo_frame)
+        if yolo_rects:
+            frame_h, frame_w = detect_frame.shape[:2]
+            yolo_h, yolo_w = yolo_frame.shape[:2]
+            return scale_detected_rects(yolo_rects, frame_w / yolo_w, frame_h / yolo_h)
+        if detector == 'yolo':
+            return []
+
+    return detect_with_scale(
+        detect_frame,
+        float(args.detect_scale),
+        bool(args.detect_multi_pass),
+        float(args.rect_max_area_ratio),
+    )
+
+
 def print_status(fps: float, best, ctrl_out) -> None:
     if best is None:
         print(f"fps={fps:.1f} rect=none rpm=({ctrl_out.yaw_rpm:.1f},{ctrl_out.pitch_rpm:.1f})")
@@ -1055,6 +1106,16 @@ def main():
     width, height = parse_size(args.size)
     if not 0.0 < args.detect_scale <= 1.0:
         raise SystemExit('--detect-scale 必须在 0 到 1 之间')
+    if not 0.0 < args.yolo_scale <= 1.0:
+        raise SystemExit('--yolo-scale 必须在 0 到 1 之间')
+    if args.detector in ('yolo', 'hybrid') and not args.yolo_command:
+        raise SystemExit('--detector yolo/hybrid 需要提供 --yolo-command')
+    if args.yolo_timeout <= 0.0:
+        raise SystemExit('--yolo-timeout 必须大于 0')
+    if not 0.0 <= args.yolo_min_confidence <= 1.0:
+        raise SystemExit('--yolo-min-confidence 必须在 0 到 1 之间')
+    if not 1 <= args.yolo_jpeg_quality <= 100:
+        raise SystemExit('--yolo-jpeg-quality 必须在 1 到 100 之间')
     if args.rect_center_weight < 0.0:
         raise SystemExit('--rect-center-weight 必须大于等于 0')
     if args.rect_prev_weight < 0.0:
@@ -1096,6 +1157,16 @@ def main():
     tracker = GimbalTracker(ctrl_cfg)
     serial = GimbalSerialStub(port=args.serial_port, baudrate=int(args.serial_baud))
     serial.open()
+    yolo_detector = None
+    if args.detector in ('yolo', 'hybrid'):
+        labels = set(args.yolo_label) if args.yolo_label else None
+        yolo_detector = YoloSubprocessDetector.from_shell_command(
+            args.yolo_command,
+            timeout_s=float(args.yolo_timeout),
+            jpeg_quality=int(args.yolo_jpeg_quality),
+            min_confidence=float(args.yolo_min_confidence),
+            labels=labels,
+        )
     rect_selector = RectSelector(
         RectSelectionConfig(
             max_area_ratio=float(args.rect_max_area_ratio),
@@ -1129,12 +1200,7 @@ def main():
             detect_frame = extract_frame(frame, width, height, args)
 
             # 对每帧执行矩形检测
-            rects = detect_with_scale(
-                detect_frame,
-                float(args.detect_scale),
-                bool(args.detect_multi_pass),
-                float(args.rect_max_area_ratio),
-            )
+            rects = detect_candidates(args, frame, detect_frame, width, height, yolo_detector)
             h, w = detect_frame.shape[:2]
             best = rect_selector.update(rects, w, h)
 
@@ -1188,6 +1254,8 @@ def main():
     finally:
         cap.release()
         serial.close()
+        if yolo_detector is not None:
+            yolo_detector.close()
         if streamer is not None:
             streamer.stop()
         if display:

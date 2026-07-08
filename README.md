@@ -118,6 +118,43 @@ http://192.168.0.98:8080/
 当前实测这些控制项对 `--awisp 0` 的 raw/NV12 路径改善有限；稳定 30 FPS 的主路径仍建议
 关闭 AWISP，再用网页预览调色辅助观察。
 
+### P4 YOLO/NPU 分支
+
+`p4-yolo-npu` 分支加入了外部 YOLO/NPU worker 的接入骨架。默认仍使用传统 CV：
+
+```bash
+--detector rect
+```
+
+如果已经有板端 NPU/VIPLite worker，可以切换：
+
+```bash
+--detector yolo --yolo-command "./build/a7a_yolo_worker --model model.nbg"
+```
+
+比赛更推荐 hybrid 模式：YOLO 有结果时使用 YOLO，YOLO 超时/无结果时回落到传统矩形检测。
+
+```bash
+python3 main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
+  --capture-mode raw --awisp 0 --detect-scale 0.25 \
+  --detector hybrid --yolo-scale 0.33 \
+  --yolo-command "python3 scripts/yolo_json_worker_stub.py"
+```
+
+Python 侧与外部 worker 使用 JSON Lines 协议：
+
+```json
+{"frame_id":1,"width":640,"height":360,"format":"jpg_b64","image":"..."}
+```
+
+worker 每行返回：
+
+```json
+{"frame_id":1,"detections":[{"bbox":[x1,y1,x2,y2],"confidence":0.9,"label":"target"}]}
+```
+
+`scripts/yolo_json_worker_stub.py` 是空检测 stub，只用于验证管道。真正 NPU worker 只要遵守同一协议即可替换。
+
 也可以用 VLC/ffplay 打开：
 
 ```text

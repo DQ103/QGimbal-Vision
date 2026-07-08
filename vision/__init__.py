@@ -15,6 +15,7 @@ from .rect_detect import (
     draw_detected_rect,
     pick_best_rect,
 )
+from .yolo_detect import YoloBox, YoloSubprocessDetector, parse_yolo_response, yolo_boxes_to_rects
 
 __all__ = [
     "DETECT_PASSES",
@@ -27,4 +28,8 @@ __all__ = [
     "detect_rectangles_multi_pass",
     "draw_detected_rect",
     "pick_best_rect",
+    "YoloBox",
+    "YoloSubprocessDetector",
+    "parse_yolo_response",
+    "yolo_boxes_to_rects",
 ]
