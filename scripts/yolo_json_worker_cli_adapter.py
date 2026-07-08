@@ -9,6 +9,9 @@ Expected external stdout:
   {"detections":[{"bbox":[x1,y1,x2,y2],"confidence":0.9,"label":"target"}]}
 or:
   [{"bbox":[x1,y1,x2,y2],"confidence":0.9,"label":"target"}]
+
+With --parser allwinner-yolov8 it also accepts Allwinner/Radxa demo output:
+  16:  95%, [ 131,  220,  308,  541], dog
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -30,20 +34,77 @@ def parse_args():
         required=True,
         help="Command template. Placeholders: {image}, {width}, {height}, {frame_id}",
     )
+    parser.add_argument(
+        "--parser",
+        choices=("auto", "json", "allwinner-yolov8"),
+        default="auto",
+        help="external output parser, default auto",
+    )
     parser.add_argument("--suffix", default=".jpg", help="temporary image suffix, default .jpg")
     parser.add_argument("--timeout", type=float, default=1.0)
     return parser.parse_args()
 
 
-def normalize_response(stdout: str, frame_id):
+ALLWINNER_DETECTION_RE = re.compile(
+    r"^\s*(?P<class_id>\d+):\s*"
+    r"(?P<percent>\d+(?:\.\d+)?)%\s*,\s*"
+    r"\[\s*(?P<x1>-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(?P<y1>-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(?P<x2>-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(?P<y2>-?\d+(?:\.\d+)?)\s*\]\s*,\s*"
+    r"(?P<label>[A-Za-z0-9_ -]+)\s*$"
+)
+
+
+def parse_json_response(stdout: str):
     text = stdout.strip()
     if not text:
-        return {"frame_id": frame_id, "detections": []}
+        return []
     payload = json.loads(text.splitlines()[-1])
     if isinstance(payload, list):
-        detections = payload
-    else:
-        detections = payload.get("detections", [])
+        return payload
+    return payload.get("detections", [])
+
+
+def parse_allwinner_yolov8_response(text: str):
+    detections = []
+    for line in text.splitlines():
+        match = ALLWINNER_DETECTION_RE.match(line)
+        if not match:
+            continue
+        data = match.groupdict()
+        detections.append(
+            {
+                "bbox": [
+                    float(data["x1"]),
+                    float(data["y1"]),
+                    float(data["x2"]),
+                    float(data["y2"]),
+                ],
+                "confidence": float(data["percent"]) / 100.0,
+                "label": data["label"].strip(),
+                "class_id": int(data["class_id"]),
+            }
+        )
+    return detections
+
+
+def normalize_response(stdout: str, stderr: str, frame_id, parser: str):
+    text = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+    if not text:
+        return {"frame_id": frame_id, "detections": []}
+
+    detections = []
+    if parser in ("auto", "json"):
+        try:
+            detections = parse_json_response(stdout)
+        except json.JSONDecodeError:
+            if parser == "json":
+                raise
+
+    if not detections and parser in ("auto", "allwinner-yolov8"):
+        detections = parse_allwinner_yolov8_response(text)
+
     return {"frame_id": frame_id, "detections": detections}
 
 
@@ -85,7 +146,7 @@ def main() -> int:
             if proc.returncode != 0:
                 response = {"frame_id": frame_id, "detections": [], "error": proc.stderr.strip()}
             else:
-                response = normalize_response(proc.stdout, frame_id)
+                response = normalize_response(proc.stdout, proc.stderr, frame_id, args.parser)
         except Exception as exc:
             response = {"frame_id": frame_id, "detections": [], "error": str(exc)}
         print(json.dumps(response), flush=True)

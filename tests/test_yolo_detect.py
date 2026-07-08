@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from vision.yolo_detect import AsyncYoloDetector, parse_yolo_response, yolo_boxes_to_rects
+from scripts.yolo_json_worker_cli_adapter import normalize_response
 
 
 def test_parse_yolo_response_filters_confidence_and_label() -> None:
@@ -96,3 +97,23 @@ def test_cli_adapter_normalizes_external_json_output() -> None:
 
     assert response["frame_id"] == 7
     assert response["detections"][0]["bbox"] == [1, 2, 3, 4]
+
+
+def test_cli_adapter_parses_allwinner_yolov8_output() -> None:
+    stderr = """
+detection num: 3
+ 1:  87%, [ 130,  136,  568,  419], bicycle
+16:  95%, [ 131,  220,  308,  541], dog
+ 2:  68%, [ 467,   74,  695,  171], car
+"""
+
+    response = normalize_response("", stderr, frame_id=8, parser="allwinner-yolov8")
+
+    assert response["frame_id"] == 8
+    assert response["detections"][0] == {
+        "bbox": [130.0, 136.0, 568.0, 419.0],
+        "confidence": 0.87,
+        "label": "bicycle",
+        "class_id": 1,
+    }
+    assert response["detections"][1]["label"] == "dog"
