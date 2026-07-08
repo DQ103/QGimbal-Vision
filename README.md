@@ -132,7 +132,8 @@ http://192.168.0.98:8080/
 --detector yolo --yolo-command "./build/a7a_yolo_worker --model model.nbg"
 ```
 
-比赛更推荐 hybrid 模式：YOLO 有结果时使用 YOLO，YOLO 超时/无结果时回落到传统矩形检测。
+比赛更推荐 hybrid 模式：YOLO 有结果时使用 YOLO，YOLO 无结果时回落到传统矩形检测。
+YOLO worker 在后台线程异步运行，主循环不会等待 NPU/YOLO 返回。
 
 ```bash
 python3 main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
@@ -141,6 +142,17 @@ python3 main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
   --yolo-every 8 \
   --yolo-command "python3 scripts/yolo_json_worker_stub.py"
 ```
+
+验证 YOLO 结果接入主流程时，用 fixed worker：
+
+```bash
+python3 main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
+  --capture-mode raw --awisp 0 --detect-scale 0.25 \
+  --detector hybrid --yolo-scale 0.33 --yolo-every 8 \
+  --yolo-command "python3 scripts/yolo_json_worker_fixed.py --bbox 0.42,0.35,0.58,0.65"
+```
+
+看到日志或画面里 `pass=100`，说明目标来自 YOLO worker。
 
 Python 侧与外部 worker 使用 JSON Lines 协议：
 
@@ -154,7 +166,15 @@ worker 每行返回：
 {"frame_id":1,"detections":[{"bbox":[x1,y1,x2,y2],"confidence":0.9,"label":"target"}]}
 ```
 
-`scripts/yolo_json_worker_stub.py` 是空检测 stub，只用于验证管道。真正 NPU worker 只要遵守同一协议即可替换。
+可用 worker/adapter：
+
+- `scripts/yolo_json_worker_stub.py`：空检测，用于验证 fallback
+- `scripts/yolo_json_worker_fixed.py`：固定框，用于验证 YOLO 结果进入 PID
+- `scripts/yolo_json_worker_cli_adapter.py`：把一次性外部 NPU demo 包成 JSONL worker
+- `npu_worker/a7a_yolo_worker.cpp`：常驻 C++ worker 骨架，后续替换为 VIPLite/NBG 推理
+
+真正 NPU worker 只要遵守同一协议即可替换。最终性能建议使用常驻 C++ worker，并把
+JPEG/base64 协议改成 raw NV12/BGR 或共享内存。
 
 也可以用 VLC/ffplay 打开：
 

@@ -5,8 +5,10 @@ import json
 import select
 import shlex
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -24,6 +26,16 @@ class YoloBox:
     y2: float
     confidence: float
     label: str = ""
+
+
+@dataclass(frozen=True)
+class AsyncYoloResult:
+    """Latest asynchronous YOLO result in submitted-frame coordinates."""
+
+    rects: List[DetectedRect]
+    frame_id: int
+    frame_size: Tuple[int, int]
+    timestamp: float
 
 
 def parse_yolo_response(line: str, min_confidence: float = 0.25, labels: Optional[Set[str]] = None) -> List[YoloBox]:
@@ -178,3 +190,85 @@ class YoloSubprocessDetector:
         assert self._proc.stdout is not None
         readable, _, _ = select.select([self._proc.stdout], [], [], self.timeout_s)
         return bool(readable)
+
+
+class AsyncYoloDetector:
+    """Run a `YoloSubprocessDetector` in a background thread.
+
+    The main loop submits the newest frame and immediately continues. The worker
+    always processes the newest pending frame and drops older pending frames.
+    """
+
+    def __init__(self, detector: YoloSubprocessDetector):
+        self.detector = detector
+        self._condition = threading.Condition()
+        self._pending_frame: Optional[np.ndarray] = None
+        self._pending_frame_id = 0
+        self._latest: Optional[AsyncYoloResult] = None
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def from_shell_command(
+        cls,
+        command: str,
+        timeout_s: float = 0.05,
+        jpeg_quality: int = 70,
+        min_confidence: float = 0.25,
+        labels: Optional[Set[str]] = None,
+    ) -> "AsyncYoloDetector":
+        return cls(
+            YoloSubprocessDetector.from_shell_command(
+                command,
+                timeout_s=timeout_s,
+                jpeg_quality=jpeg_quality,
+                min_confidence=min_confidence,
+                labels=labels,
+            )
+        )
+
+    def submit(self, frame_bgr: np.ndarray) -> int:
+        with self._condition:
+            self._pending_frame = frame_bgr.copy()
+            self._pending_frame_id += 1
+            frame_id = self._pending_frame_id
+            self._condition.notify()
+            return frame_id
+
+    def latest(self) -> Optional[AsyncYoloResult]:
+        with self._condition:
+            return self._latest
+
+    def close(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._thread.join(timeout=1.0)
+        self.detector.close()
+
+    def _run(self) -> None:
+        last_processed_id = 0
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._stopped or self._pending_frame_id != last_processed_id
+                )
+                if self._stopped:
+                    return
+                frame = self._pending_frame
+                frame_id = self._pending_frame_id
+                last_processed_id = frame_id
+
+            if frame is None:
+                continue
+
+            rects = self.detector.detect(frame)
+            result = AsyncYoloResult(
+                rects=rects,
+                frame_id=frame_id,
+                frame_size=(int(frame.shape[1]), int(frame.shape[0])),
+                timestamp=time.monotonic(),
+            )
+            with self._condition:
+                self._latest = result

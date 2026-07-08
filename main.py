@@ -36,7 +36,7 @@ from vision.rect_detect import (
     detect_rectangles_multi_pass,
     draw_detected_rect,
 )
-from vision.yolo_detect import YoloSubprocessDetector
+from vision.yolo_detect import AsyncYoloDetector
 
 from control.config import ControlConfig
 from control.serial_stub import GimbalSerialStub
@@ -1070,7 +1070,7 @@ def detect_candidates(
     detect_frame,
     width: int,
     height: int,
-    yolo_detector: Optional[YoloSubprocessDetector],
+    yolo_detector: Optional[AsyncYoloDetector],
     frame_index: int,
 ):
     detector = args.detector
@@ -1078,11 +1078,13 @@ def detect_candidates(
         should_run_yolo = frame_index % int(args.yolo_every) == 0
         if should_run_yolo:
             yolo_frame = make_display_frame(raw_frame, detect_frame, width, height, args, float(args.yolo_scale))
-            yolo_rects = yolo_detector.detect(yolo_frame)
-            if yolo_rects:
-                frame_h, frame_w = detect_frame.shape[:2]
-                yolo_h, yolo_w = yolo_frame.shape[:2]
-                return scale_detected_rects(yolo_rects, frame_w / yolo_w, frame_h / yolo_h)
+            yolo_detector.submit(yolo_frame)
+
+        yolo_result = yolo_detector.latest()
+        if yolo_result is not None and yolo_result.rects:
+            frame_h, frame_w = detect_frame.shape[:2]
+            yolo_w, yolo_h = yolo_result.frame_size
+            return scale_detected_rects(yolo_result.rects, frame_w / yolo_w, frame_h / yolo_h)
         if detector == 'yolo':
             return []
 
@@ -1168,7 +1170,7 @@ def main():
     yolo_detector = None
     if args.detector in ('yolo', 'hybrid'):
         labels = set(args.yolo_label) if args.yolo_label else None
-        yolo_detector = YoloSubprocessDetector.from_shell_command(
+        yolo_detector = AsyncYoloDetector.from_shell_command(
             args.yolo_command,
             timeout_s=float(args.yolo_timeout),
             jpeg_quality=int(args.yolo_jpeg_quality),
