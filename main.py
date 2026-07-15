@@ -28,6 +28,24 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
+from vision.a4_target import (
+    a4_center_mm,
+    A4TargetConfig,
+    A4TargetTracker,
+    detection_as_rect,
+    find_black_band_candidates,
+    map_image_point_to_a4,
+    merge_candidates,
+)
+from vision.competition_vision import (
+    AimReadyGate,
+    HybridLaserConfig,
+    HybridLaserTracker,
+    TrackedTarget,
+    TargetTracker,
+    resolve_stage,
+    stage_error,
+)
 from vision.rect_detect import (
     DetectedRect,
     RectSelectionConfig,
@@ -45,6 +63,7 @@ from control.tracker_control import GimbalTracker
 DEFAULT_CAMERA = 0  # 摄像头索引（legacy V4L2 backend）
 DEFAULT_DEVICE = "/dev/video0"
 DEFAULT_SUBDEV = "/dev/v4l-subdev0"
+DEFAULT_SET_SUBDEV_FORMAT = 1
 DEFAULT_WIDTH = 1920  # 期望宽度
 DEFAULT_HEIGHT = 1080  # 期望高度
 DEFAULT_FPS = 30  # 期望帧率
@@ -58,6 +77,24 @@ DEFAULT_RECT_CENTER_WEIGHT = 0.25
 DEFAULT_RECT_PREV_WEIGHT = 0.70
 DEFAULT_RECT_MAX_ASPECT = 5.0
 DEFAULT_RECT_MAX_AREA_RATIO = 0.5
+DEFAULT_COMPETITION_MODE = 0
+DEFAULT_TARGET_MISS_FRAMES = 3
+DEFAULT_AIM_ENTER_RADIUS_RATIO = 0.085
+DEFAULT_AIM_EXIT_RADIUS_RATIO = 0.12
+DEFAULT_AIM_CONFIRM_FRAMES = 3
+DEFAULT_LASER_HOLD_FRAMES = 2
+DEFAULT_LASER_MIN_LUMA = 165
+DEFAULT_LASER_FALLBACK_MIN_LUMA = 210
+DEFAULT_A4_TARGET = 0
+DEFAULT_A4_GLOBAL_INTERVAL = 10
+DEFAULT_A4_SEARCH_INTERVAL = 6
+DEFAULT_A4_LOCAL_VALIDATE_INTERVAL = 3
+DEFAULT_A4_MIN_AREA_RATIO = 0.015
+DEFAULT_A4_MIN_APPARENT_ASPECT = 1.08
+DEFAULT_A4_ACQUIRE_CONFIDENCE = 0.72
+DEFAULT_A4_TRACK_CONFIDENCE = 0.52
+DEFAULT_A4_OCCLUSION_FRAMES = 20
+DEFAULT_A4_REQUIRE_RED_RINGS = 1
 DEFAULT_DETECTOR = "rect"
 DEFAULT_YOLO_SCALE = 0.33
 DEFAULT_YOLO_EVERY = 1
@@ -183,10 +220,16 @@ def parse_args():
                    help=f'V4L2 设备路径（默认 {DEFAULT_DEVICE}）')
     p.add_argument('--subdev', type=str, default=DEFAULT_SUBDEV,
                    help=f'传感器 subdev 路径（默认 {DEFAULT_SUBDEV}）')
+    p.add_argument('--set-subdev-format', type=int, choices=[0, 1], default=DEFAULT_SET_SUBDEV_FORMAT,
+                   help='启动前是否通过 v4l2-ctl 设置 subdev RAW10 格式；官方 IMX415 管线应设为 0')
     p.add_argument('--size', type=str, default=f'{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}',
                    help=f'采集尺寸 WxH（默认 {DEFAULT_WIDTH}x{DEFAULT_HEIGHT}）')
+    p.add_argument('--output-size', type=str, default='',
+                   help='BGR 模式下 GStreamer 输出尺寸 WxH；留空表示与采集尺寸相同')
     p.add_argument('--fps', type=int, default=DEFAULT_FPS,
                    help=f'采集帧率（默认 {DEFAULT_FPS}）')
+    p.add_argument('--max-processing-fps', type=float, default=0.0,
+                   help='限制检测和推流循环帧率；0 表示不限制')
     p.add_argument('--format', type=str, default=DEFAULT_FORMAT,
                    help=f'GStreamer v4l2src 输出格式（默认 {DEFAULT_FORMAT}，可试 NV12/RGB）')
     p.add_argument('--capture-mode', choices=['raw', 'bgr'], default=DEFAULT_CAPTURE_MODE,
@@ -209,6 +252,46 @@ def parse_args():
                    help=f'候选矩形最大长宽比（默认 {DEFAULT_RECT_MAX_ASPECT}）')
     p.add_argument('--rect-max-area-ratio', type=float, default=DEFAULT_RECT_MAX_AREA_RATIO,
                    help=f'候选矩形最大面积占比（默认 {DEFAULT_RECT_MAX_AREA_RATIO}）')
+    p.add_argument('--competition-mode', type=int, choices=[0, 1], default=DEFAULT_COMPETITION_MODE,
+                   help='启用矩形对中、激光门控与融合激光跟踪实验（0/1）')
+    p.add_argument('--target-miss-frames', type=int, default=DEFAULT_TARGET_MISS_FRAMES,
+                   help=f'连续多少帧丢失后清除矩形跟踪（默认 {DEFAULT_TARGET_MISS_FRAMES}）')
+    p.add_argument('--aim-enter-radius-ratio', type=float, default=DEFAULT_AIM_ENTER_RADIUS_RATIO,
+                   help='目标进入就绪状态的半径，占画面短边比例')
+    p.add_argument('--aim-exit-radius-ratio', type=float, default=DEFAULT_AIM_EXIT_RADIUS_RATIO,
+                   help='目标退出就绪状态的迟滞半径，占画面短边比例')
+    p.add_argument('--aim-confirm-frames', type=int, default=DEFAULT_AIM_CONFIRM_FRAMES,
+                   help=f'目标连续对中确认帧数（默认 {DEFAULT_AIM_CONFIRM_FRAMES}）')
+    p.add_argument('--aim-offset-x-ratio', type=float, default=0.0,
+                   help='标定中心相对画面中心的水平偏移，占画面宽度比例')
+    p.add_argument('--aim-offset-y-ratio', type=float, default=0.0,
+                   help='标定中心相对画面中心的垂直偏移，占画面高度比例')
+    p.add_argument('--laser-hold-frames', type=int, default=DEFAULT_LASER_HOLD_FRAMES,
+                   help=f'激光漏检后仅用于显示和关联的保持帧数（默认 {DEFAULT_LASER_HOLD_FRAMES}）')
+    p.add_argument('--laser-min-luma', type=int, default=DEFAULT_LASER_MIN_LUMA,
+                   help=f'动态高亮检测最低灰度（默认 {DEFAULT_LASER_MIN_LUMA}）')
+    p.add_argument('--laser-fallback-min-luma', type=int, default=DEFAULT_LASER_FALLBACK_MIN_LUMA,
+                   help=f'没有紫色光晕时允许亮点候选的最低灰度（默认 {DEFAULT_LASER_FALLBACK_MIN_LUMA}）')
+    p.add_argument('--a4-target', type=int, choices=[0, 1], default=DEFAULT_A4_TARGET,
+                   help='启用无NPU A4靶纸结构验证和空间时域跟踪（0/1）')
+    p.add_argument('--a4-global-interval', type=int, default=DEFAULT_A4_GLOBAL_INTERVAL,
+                   help=f'稳定跟踪时每多少帧执行一次全局重检（默认 {DEFAULT_A4_GLOBAL_INTERVAL}）')
+    p.add_argument('--a4-search-interval', type=int, default=DEFAULT_A4_SEARCH_INTERVAL,
+                   help=f'未锁定时每多少帧执行一次全局搜索（默认 {DEFAULT_A4_SEARCH_INTERVAL}）')
+    p.add_argument('--a4-local-validate-interval', type=int, default=DEFAULT_A4_LOCAL_VALIDATE_INTERVAL,
+                   help=f'光流跟踪时每多少帧执行一次完整A4结构复核（默认 {DEFAULT_A4_LOCAL_VALIDATE_INTERVAL}）')
+    p.add_argument('--a4-min-area-ratio', type=float, default=DEFAULT_A4_MIN_AREA_RATIO,
+                   help=f'A4候选最小画面面积占比（默认 {DEFAULT_A4_MIN_AREA_RATIO}）')
+    p.add_argument('--a4-min-apparent-aspect', type=float, default=DEFAULT_A4_MIN_APPARENT_ASPECT,
+                   help=f'A4候选最小表观长宽比（默认 {DEFAULT_A4_MIN_APPARENT_ASPECT}）')
+    p.add_argument('--a4-acquire-confidence', type=float, default=DEFAULT_A4_ACQUIRE_CONFIDENCE,
+                   help=f'A4首次锁定置信度门限（默认 {DEFAULT_A4_ACQUIRE_CONFIDENCE}）')
+    p.add_argument('--a4-track-confidence', type=float, default=DEFAULT_A4_TRACK_CONFIDENCE,
+                   help=f'A4正常跟踪置信度门限（默认 {DEFAULT_A4_TRACK_CONFIDENCE}）')
+    p.add_argument('--a4-occlusion-frames', type=int, default=DEFAULT_A4_OCCLUSION_FRAMES,
+                   help=f'A4部分遮挡最大保持帧数（默认 {DEFAULT_A4_OCCLUSION_FRAMES}）')
+    p.add_argument('--a4-require-red-rings', type=int, choices=[0, 1], default=DEFAULT_A4_REQUIRE_RED_RINGS,
+                   help='A4首次锁定是否要求红色圆环结构（0/1）')
     p.add_argument('--detector', choices=['rect', 'yolo', 'hybrid'], default=DEFAULT_DETECTOR,
                    help=f'检测器：rect 传统CV，yolo 外部NPU/YOLO，hybrid YOLO优先传统CV兜底（默认 {DEFAULT_DETECTOR}）')
     p.add_argument('--yolo-command', type=str, default='',
@@ -328,6 +411,8 @@ def build_gst_pipeline(
     device: str,
     width: int,
     height: int,
+    output_width: int,
+    output_height: int,
     fps: int,
     raw_format: str,
     capture_mode: str,
@@ -341,20 +426,32 @@ def build_gst_pipeline(
     if capture_mode == 'raw':
         return src + 'queue max-size-buffers=1 leaky=downstream ! appsink drop=true max-buffers=1 sync=false'
 
-    return src + 'videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false'
+    if (output_width, output_height) != (width, height):
+        src += (
+            'videoscale ! '
+            f'video/x-raw,format={raw_format},width={output_width},height={output_height} ! '
+        )
+    return (
+        src
+        + 'videoconvert ! video/x-raw,format=BGR ! '
+        + 'queue max-size-buffers=1 leaky=downstream ! appsink drop=true max-buffers=1 sync=false'
+    )
 
 
-def open_capture(args, width: int, height: int):
+def open_capture(args, width: int, height: int, output_width: int, output_height: int):
     if args.backend == 'gstreamer':
         if args.capture_mode == 'raw' and args.format.upper() != 'NV12':
             raise SystemExit('--capture-mode raw 目前只支持 --format NV12')
-        set_sensor_format(args.subdev, width, height)
+        if args.set_subdev_format:
+            set_sensor_format(args.subdev, width, height)
         if args.v4l2_ctrl:
             apply_v4l2_controls(args.device, args.v4l2_ctrl)
         pipeline = build_gst_pipeline(
             args.device,
             width,
             height,
+            output_width,
+            output_height,
             args.fps,
             args.format,
             args.capture_mode,
@@ -426,6 +523,90 @@ def scale_detected_rects(rects, scale_x: float, scale_y: float):
     return [scale_detected_rect(rect, scale_x, scale_y) for rect in rects]
 
 
+def _scale_xywh(box, scale_x: float, scale_y: float):
+    if box is None:
+        return None
+    x, y, w, h = box
+    return (
+        int(round(x * scale_x)),
+        int(round(y * scale_y)),
+        max(1, int(round(w * scale_x))),
+        max(1, int(round(h * scale_y))),
+    )
+
+
+def make_competition_overlay(
+    target,
+    laser,
+    aim_status,
+    stage,
+    error,
+    frame_w: int,
+    frame_h: int,
+    aim_radius_ratio: float,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    a4_result=None,
+    a4_require_red_rings=None,
+):
+    if aim_status is None or stage is None:
+        return None
+    overlay = {
+        "target_current": bool(target is not None and target.current),
+        "target_held": bool(target is not None and target.held),
+        "laser_current": bool(laser is not None and laser.current),
+        "laser_held": bool(laser is not None and laser.held),
+        "laser_center": None if laser is None else (
+            laser.center[0] * scale_x,
+            laser.center[1] * scale_y,
+        ),
+        "laser_bbox": None if laser is None else _scale_xywh(laser.bbox, scale_x, scale_y),
+        "laser_roi": None if laser is None else _scale_xywh(laser.roi, scale_x, scale_y),
+        "laser_score": 0.0 if laser is None else laser.score,
+        "laser_luma": 0 if laser is None else laser.max_luma,
+        "laser_violet": 0 if laser is None else laser.violet_pixels,
+        "aim_center": (
+            aim_status.center[0] * scale_x,
+            aim_status.center[1] * scale_y,
+        ),
+        "aim_radius": aim_radius_ratio * min(frame_w * scale_x, frame_h * scale_y),
+        "ready": aim_status.ready,
+        "confirm_count": aim_status.confirm_count,
+        "stage": stage.value,
+        "error": (error[0] * scale_x, error[1] * scale_y),
+    }
+    if a4_result is None:
+        return overlay
+
+    detection = a4_result.detection
+    overlay["a4_state"] = a4_result.state.value
+    overlay["a4_require_red_rings"] = bool(a4_require_red_rings)
+    overlay["a4_current"] = a4_result.current
+    overlay["a4_predicted"] = a4_result.predicted
+    overlay["a4_miss_count"] = a4_result.miss_count
+    overlay["a4_flow_inliers"] = a4_result.flow_inliers
+    overlay["a4_confidence"] = 0.0 if detection is None else detection.confidence
+    overlay["a4_structural"] = 0.0 if detection is None else detection.structural_confidence
+    overlay["a4_edge"] = 0.0 if detection is None else detection.scores.edge
+    overlay["a4_black"] = 0.0 if detection is None else detection.scores.black_band
+    overlay["a4_red"] = 0.0 if detection is None else detection.scores.red_rings
+    overlay["a4_temporal"] = 0.0 if detection is None else detection.scores.temporal
+    overlay["a4_visible_sides"] = 0 if detection is None else detection.scores.visible_sides
+    overlay["a4_edge_points"] = () if detection is None else tuple(
+        (x * scale_x, y * scale_y, score) for x, y, score in detection.edge_points
+    )
+    overlay["a4_canonical"] = None if detection is None else detection.canonical
+    overlay["a4_error_mm"] = None
+    if detection is not None and laser is not None and laser.current:
+        laser_mm = map_image_point_to_a4(detection, laser.center)
+        target_mm = a4_center_mm(detection)
+        overlay["a4_error_mm"] = (
+            target_mm[0] - laser_mm[0],
+            target_mm[1] - laser_mm[1],
+        )
+    return overlay
+
+
 def make_display_frame(raw_frame, detect_frame, width: int, height: int, args, output_scale: float = 1.0):
     output_width, output_height = scaled_size(width, height, output_scale)
     if args.backend == 'gstreamer' and args.capture_mode == 'raw':
@@ -463,7 +644,15 @@ def scale_display_frame(display_frame, display_scale: float):
     return cv2.resize(display_frame, (0, 0), fx=display_scale, fy=display_scale, interpolation=cv2.INTER_AREA)
 
 
-def draw_overlay(display_frame, best, ctrl_out, fps: float, frame_w: int, frame_h: int):
+def draw_overlay(
+    display_frame,
+    best,
+    ctrl_out,
+    fps: float,
+    frame_w: int,
+    frame_h: int,
+    competition=None,
+):
     is_gray_display = display_frame.ndim == 2
     rect_color = 255 if is_gray_display else (0, 255, 0)
     marker_color = 255 if is_gray_display else (255, 0, 0)
@@ -471,7 +660,11 @@ def draw_overlay(display_frame, best, ctrl_out, fps: float, frame_w: int, frame_
     control_text_color = 200 if is_gray_display else (0, 255, 255)
 
     if best is not None:
-        draw_detected_rect(display_frame, best, color=rect_color)
+        if competition is not None and competition["target_held"]:
+            target_color = 220 if is_gray_display else (0, 255, 255)
+        else:
+            target_color = rect_color
+        draw_detected_rect(display_frame, best, color=target_color)
 
     cv2.drawMarker(
         display_frame,
@@ -501,6 +694,149 @@ def draw_overlay(display_frame, best, ctrl_out, fps: float, frame_w: int, frame_
             control_text_color,
             2,
         )
+
+    if competition is None:
+        return
+
+    aim_x, aim_y = competition["aim_center"]
+    ready_color = 255 if is_gray_display else ((0, 255, 0) if competition["ready"] else (0, 165, 255))
+    cv2.circle(
+        display_frame,
+        (int(round(aim_x)), int(round(aim_y))),
+        max(4, int(round(competition["aim_radius"]))),
+        ready_color,
+        1,
+    )
+
+    laser_roi = competition["laser_roi"]
+    if laser_roi is not None:
+        cv2.rectangle(display_frame, laser_roi, 180 if is_gray_display else (0, 255, 255), 1)
+
+    laser_bbox = competition["laser_bbox"]
+    laser_center = competition["laser_center"]
+    if laser_bbox is not None and laser_center is not None:
+        laser_color = 255 if is_gray_display else (
+            (255, 255, 255) if competition["laser_current"] else (0, 255, 255)
+        )
+        cv2.rectangle(display_frame, laser_bbox, laser_color, 2)
+        cv2.drawMarker(
+            display_frame,
+            (int(round(laser_center[0])), int(round(laser_center[1]))),
+            laser_color,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=14,
+            thickness=2,
+        )
+
+    err_x, err_y = competition["error"]
+    cv2.putText(
+        display_frame,
+        f"stage={competition['stage']} ready={int(competition['ready'])} confirm={competition['confirm_count']}",
+        (10, 125),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        control_text_color,
+        2,
+    )
+    cv2.putText(
+        display_frame,
+        f"vision_err=({err_x:.0f},{err_y:.0f}) laser_score={competition['laser_score']:.0f} "
+        f"luma={competition['laser_luma']} violet={competition['laser_violet']}",
+        (10, 150),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        control_text_color,
+        1,
+    )
+
+    if "a4_state" not in competition:
+        return
+
+    for x, y, score in competition["a4_edge_points"]:
+        if is_gray_display:
+            point_color = 255 if score >= 0.45 else 120
+        else:
+            if score >= 0.45:
+                point_color = (0, 255, 0)
+            elif score >= 0.30:
+                point_color = (0, 215, 255)
+            else:
+                point_color = (0, 0, 255)
+        cv2.circle(display_frame, (int(round(x)), int(round(y))), 2, point_color, -1)
+
+    cv2.putText(
+        display_frame,
+        f"a4={competition['a4_state']} mode={'full' if competition['a4_require_red_rings'] else 'frame'} "
+        f"conf={competition['a4_confidence']:.2f} "
+        f"struct={competition['a4_structural']:.2f} sides={competition['a4_visible_sides']} "
+        f"flow={competition['a4_flow_inliers']}",
+        (10, 178),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        control_text_color,
+        1,
+    )
+    cv2.putText(
+        display_frame,
+        f"edge={competition['a4_edge']:.2f} black={competition['a4_black']:.2f} "
+        f"red={competition['a4_red']:.2f} temporal={competition['a4_temporal']:.2f}",
+        (10, 202),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        control_text_color,
+        1,
+    )
+    if competition["a4_error_mm"] is not None:
+        error_mm_x, error_mm_y = competition["a4_error_mm"]
+        cv2.putText(
+            display_frame,
+            f"laser_error_mm=({error_mm_x:.1f},{error_mm_y:.1f})",
+            (10, 226),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            control_text_color,
+            2,
+        )
+
+    canonical = competition["a4_canonical"]
+    if canonical is not None and not is_gray_display:
+        thumb_width = min(150, max(80, frame_w // 6))
+        thumb_height = max(1, int(round(canonical.shape[0] * thumb_width / canonical.shape[1])))
+        if thumb_height > frame_h // 3:
+            thumb_height = frame_h // 3
+            thumb_width = max(1, int(round(canonical.shape[1] * thumb_height / canonical.shape[0])))
+        thumbnail = cv2.resize(canonical, (thumb_width, thumb_height), interpolation=cv2.INTER_AREA)
+        x1 = frame_w - thumb_width - 10
+        y1 = 10
+        display_frame[y1 : y1 + thumb_height, x1 : x1 + thumb_width] = thumbnail
+        cv2.rectangle(display_frame, (x1, y1), (x1 + thumb_width, y1 + thumb_height), (0, 255, 255), 1)
+
+
+class A4RuntimeSettings:
+    def __init__(self, enabled: bool, require_red_rings: bool):
+        self._lock = threading.Lock()
+        self.enabled = bool(enabled)
+        self._require_red_rings = bool(require_red_rings)
+
+    def get_require_red_rings(self) -> bool:
+        with self._lock:
+            return self._require_red_rings
+
+    def set_values(self, payload):
+        with self._lock:
+            if "require_red_rings" in payload:
+                self._require_red_rings = bool(payload["require_red_rings"])
+            return self.as_payload_unlocked()
+
+    def as_payload(self):
+        with self._lock:
+            return self.as_payload_unlocked()
+
+    def as_payload_unlocked(self):
+        return {
+            "enabled": self.enabled,
+            "require_red_rings": self._require_red_rings,
+        }
 
 
 class ColorAdjust:
@@ -727,6 +1063,9 @@ def build_preview_html():
     input[type=range] {{ width:100%; }}
     output {{ text-align:right; color:#b7d7ff; font-variant-numeric:tabular-nums; }}
     .presets {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:0 0 14px; }}
+    .a4-settings {{ margin:0 0 18px; padding:0 0 16px; border-bottom:1px solid #333; }}
+    .toggle {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0; }}
+    .toggle input {{ width:18px; height:18px; }}
     button {{ width:100%; margin-top:12px; padding:9px 10px; border:0; color:#111; background:#eee; cursor:pointer; }}
     .presets button {{ margin-top:0; }}
     pre {{ white-space:pre-wrap; color:#aaa; font-size:12px; line-height:1.4; }}
@@ -737,6 +1076,10 @@ def build_preview_html():
   <main>
     <section class="preview"><img src="/stream.mjpg"></section>
     <aside>
+      <section id="a4-settings" class="a4-settings" hidden>
+        <h1>A4 Target</h1>
+        <label class="toggle"><span>Require red rings</span><input id="require-red-rings" type="checkbox"></label>
+      </section>
       <h1>Color Adjust</h1>
       <div class="presets">
         <button data-preset="a7a_realtime">Realtime</button>
@@ -754,6 +1097,25 @@ def build_preview_html():
     const keys = {json.dumps([key for key, _ in controls])};
     let ranges = {{}};
     let sendTimer = null;
+
+    async function loadA4Settings() {{
+      const res = await fetch('/api/a4');
+      const data = await res.json();
+      if (!data.enabled) return;
+      const section = document.getElementById('a4-settings');
+      const toggle = document.getElementById('require-red-rings');
+      section.hidden = false;
+      toggle.checked = Boolean(data.require_red_rings);
+      toggle.addEventListener('change', async () => {{
+        const response = await fetch('/api/a4', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{require_red_rings: toggle.checked}}),
+        }});
+        const updated = await response.json();
+        toggle.checked = Boolean(updated.require_red_rings);
+      }});
+    }}
 
     async function loadControls() {{
       const res = await fetch('/api/color');
@@ -841,16 +1203,24 @@ def build_preview_html():
       button.addEventListener('click', () => applyPreset(button.dataset.preset));
     }}
     loadControls();
+    loadA4Settings();
   </script>
 </body>
 </html>"""
 
 
 class MjpegStreamer:
-    def __init__(self, host: str, port: int, quality: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        quality: int,
+        a4_settings: A4RuntimeSettings,
+    ):
         self.host = host
         self.port = port
         self.quality = quality
+        self.a4_settings = a4_settings
         self.color_adjust = ColorAdjust()
         self._condition = threading.Condition()
         self._jpeg: Optional[bytes] = None
@@ -879,6 +1249,10 @@ class MjpegStreamer:
                     self.send_header('Content-Length', str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+
+                if parsed.path == '/api/a4':
+                    self._send_json(streamer.a4_settings.as_payload())
                     return
 
                 if parsed.path == '/api/color':
@@ -935,6 +1309,19 @@ class MjpegStreamer:
 
             def do_POST(self):
                 parsed = urlparse(self.path)
+                if parsed.path == '/api/a4':
+                    length = int(self.headers.get('Content-Length', '0') or '0')
+                    body = self.rfile.read(length) if length > 0 else b''
+                    payload = {}
+                    if body:
+                        try:
+                            payload = json.loads(body.decode('utf-8'))
+                        except json.JSONDecodeError:
+                            self.send_error(HTTPStatus.BAD_REQUEST, 'Invalid JSON')
+                            return
+                    self._send_json(streamer.a4_settings.set_values(payload))
+                    return
+
                 if parsed.path == '/api/color/reset':
                     streamer.color_adjust.reset()
                     self._send_json(streamer.color_adjust.as_payload())
@@ -1096,22 +1483,37 @@ def detect_candidates(
     )
 
 
-def print_status(fps: float, best, ctrl_out) -> None:
+def print_status(fps: float, best, ctrl_out, a4_result=None) -> None:
+    a4_text = ""
+    if a4_result is not None:
+        confidence = 0.0 if a4_result.detection is None else a4_result.detection.confidence
+        a4_text = (
+            f" a4={a4_result.state.value} conf={confidence:.2f} "
+            f"flow={a4_result.flow_inliers} miss={a4_result.miss_count}"
+        )
     if best is None:
-        print(f"fps={fps:.1f} rect=none rpm=({ctrl_out.yaw_rpm:.1f},{ctrl_out.pitch_rpm:.1f})")
+        print(f"fps={fps:.1f} rect=none rpm=({ctrl_out.yaw_rpm:.1f},{ctrl_out.pitch_rpm:.1f}){a4_text}")
     else:
         cx, cy = best.center
         area = best.area
         print(
             f"fps={fps:.1f} cx={cx:.1f} cy={cy:.1f} area={area:.0f} "
             f"pass={best.pass_index} score={best.score:.2f} "
-            f"err=({ctrl_out.err_x_px:.0f},{ctrl_out.err_y_px:.0f}) rpm=({ctrl_out.yaw_rpm:.1f},{ctrl_out.pitch_rpm:.1f})"
+            f"err=({ctrl_out.err_x_px:.0f},{ctrl_out.err_y_px:.0f}) "
+            f"rpm=({ctrl_out.yaw_rpm:.1f},{ctrl_out.pitch_rpm:.1f}){a4_text}"
         )
 
 
 def main():
     args = parse_args()
     width, height = parse_size(args.size)
+    output_width, output_height = (
+        parse_size(args.output_size) if args.output_size else (width, height)
+    )
+    if args.capture_mode == 'raw' and (output_width, output_height) != (width, height):
+        raise SystemExit('--output-size 仅支持 --capture-mode bgr')
+    if args.max_processing_fps < 0.0:
+        raise SystemExit('--max-processing-fps 必须大于等于 0')
     if not 0.0 < args.detect_scale <= 1.0:
         raise SystemExit('--detect-scale 必须在 0 到 1 之间')
     if not 0.0 < args.yolo_scale <= 1.0:
@@ -1134,6 +1536,36 @@ def main():
         raise SystemExit('--rect-max-aspect 必须大于等于 1')
     if not 0.0 < args.rect_max_area_ratio <= 1.0:
         raise SystemExit('--rect-max-area-ratio 必须在 0 到 1 之间')
+    if args.target_miss_frames < 1:
+        raise SystemExit('--target-miss-frames 必须大于等于 1')
+    if args.aim_enter_radius_ratio <= 0.0:
+        raise SystemExit('--aim-enter-radius-ratio 必须大于 0')
+    if args.aim_exit_radius_ratio < args.aim_enter_radius_ratio:
+        raise SystemExit('--aim-exit-radius-ratio 必须大于等于 --aim-enter-radius-ratio')
+    if args.aim_confirm_frames < 1:
+        raise SystemExit('--aim-confirm-frames 必须大于等于 1')
+    if args.laser_hold_frames < 0:
+        raise SystemExit('--laser-hold-frames 必须大于等于 0')
+    if not 0 <= args.laser_min_luma <= 255:
+        raise SystemExit('--laser-min-luma 必须在 0 到 255 之间')
+    if not args.laser_min_luma <= args.laser_fallback_min_luma <= 255:
+        raise SystemExit('--laser-fallback-min-luma 必须不低于 --laser-min-luma 且不超过 255')
+    if args.a4_global_interval < 1:
+        raise SystemExit('--a4-global-interval 必须大于等于 1')
+    if args.a4_search_interval < 1:
+        raise SystemExit('--a4-search-interval 必须大于等于 1')
+    if args.a4_local_validate_interval < 1:
+        raise SystemExit('--a4-local-validate-interval 必须大于等于 1')
+    if not 0.0 < args.a4_min_area_ratio < args.rect_max_area_ratio:
+        raise SystemExit('--a4-min-area-ratio 必须大于 0 且小于 --rect-max-area-ratio')
+    if not 1.0 <= args.a4_min_apparent_aspect < 2.3:
+        raise SystemExit('--a4-min-apparent-aspect 必须在 1.0 到 2.3 之间')
+    if not 0.0 <= args.a4_track_confidence <= args.a4_acquire_confidence <= 1.0:
+        raise SystemExit('A4跟踪门限必须不高于首次锁定门限，且均在 0 到 1 之间')
+    if args.a4_occlusion_frames < 1:
+        raise SystemExit('--a4-occlusion-frames 必须大于等于 1')
+    if args.a4_target and args.detector != 'rect':
+        raise SystemExit('--a4-target 目前只支持 --detector rect，无需NPU/YOLO')
     if not 0.0 < args.display_scale <= 1.0:
         raise SystemExit('--display-scale 必须在 0 到 1 之间')
     if args.display_every < 1:
@@ -1147,12 +1579,21 @@ def main():
     if args.stream_port < 0:
         raise SystemExit('--stream-port 必须大于等于 0')
 
-    cap = open_capture(args, width, height)
+    cap = open_capture(args, width, height, output_width, output_height)
 
     display = bool(args.display)
+    a4_settings = A4RuntimeSettings(
+        enabled=bool(args.a4_target),
+        require_red_rings=bool(args.a4_require_red_rings),
+    )
     streamer = None
     if args.stream_port > 0:
-        streamer = MjpegStreamer(args.stream_host, args.stream_port, int(args.stream_quality))
+        streamer = MjpegStreamer(
+            args.stream_host,
+            args.stream_port,
+            int(args.stream_quality),
+            a4_settings,
+        )
         streamer.start()
         print(f'MJPEG preview: http://<board-ip>:{streamer.port}/  stream=/stream.mjpg snapshot=/snapshot.jpg')
 
@@ -1177,14 +1618,63 @@ def main():
             min_confidence=float(args.yolo_min_confidence),
             labels=labels,
         )
-    rect_selector = RectSelector(
-        RectSelectionConfig(
-            max_area_ratio=float(args.rect_max_area_ratio),
-            max_aspect_ratio=float(args.rect_max_aspect),
-            center_weight=float(args.rect_center_weight),
-            previous_weight=float(args.rect_prev_weight),
-        )
+    selection_config = RectSelectionConfig(
+        max_area_ratio=float(args.rect_max_area_ratio),
+        max_aspect_ratio=float(args.rect_max_aspect),
+        center_weight=float(args.rect_center_weight),
+        previous_weight=float(args.rect_prev_weight),
     )
+    a4_mode = bool(args.a4_target)
+    competition_mode = bool(args.competition_mode or a4_mode)
+    rect_selector = None if competition_mode else RectSelector(selection_config)
+    target_tracker = None
+    a4_tracker = None
+    aim_gate = None
+    laser_tracker = None
+    if competition_mode:
+        if a4_mode:
+            a4_tracker = A4TargetTracker(
+                A4TargetConfig(
+                    min_area_ratio=float(args.a4_min_area_ratio),
+                    max_area_ratio=float(args.rect_max_area_ratio),
+                    min_apparent_aspect=float(args.a4_min_apparent_aspect),
+                    acquire_confidence=float(args.a4_acquire_confidence),
+                    track_confidence=float(args.a4_track_confidence),
+                    occlusion_hold_frames=int(args.a4_occlusion_frames),
+                    global_interval=int(args.a4_global_interval),
+                    search_interval=int(args.a4_search_interval),
+                    local_validate_interval=int(args.a4_local_validate_interval),
+                ),
+                require_red_rings=a4_settings.get_require_red_rings(),
+            )
+        else:
+            target_tracker = TargetTracker(
+                selection_config,
+                miss_confirm_frames=int(args.target_miss_frames),
+            )
+        aim_gate = AimReadyGate(
+            enter_radius_ratio=float(args.aim_enter_radius_ratio),
+            exit_radius_ratio=float(args.aim_exit_radius_ratio),
+            confirm_frames=int(args.aim_confirm_frames),
+            offset_x_ratio=float(args.aim_offset_x_ratio),
+            offset_y_ratio=float(args.aim_offset_y_ratio),
+        )
+        laser_tracker = HybridLaserTracker(
+            HybridLaserConfig(
+                min_dynamic_luma=int(args.laser_min_luma),
+                fallback_min_luma=int(args.laser_fallback_min_luma),
+                hold_frames=int(args.laser_hold_frames),
+            )
+        )
+        print(
+            'Competition vision enabled: target hold, aim gate, '
+            'LAB violet + dynamic bright-core laser tracking'
+        )
+        if a4_mode:
+            print(
+                'A4 target mode enabled: black-tape/red-ring structure, '
+                '64 edge points, LK homography and occlusion state machine'
+            )
 
     win_name = f"Camera {args.device if args.backend == 'gstreamer' else args.camera}"
     if display:
@@ -1197,6 +1687,8 @@ def main():
     fps_window_start = prev_time
     fps_window_frames = 0
     frame_index = 0
+    frame_period = 1.0 / args.max_processing_fps if args.max_processing_fps > 0.0 else 0.0
+    next_frame_deadline = time.monotonic()
 
     try:
         while True:
@@ -1207,12 +1699,73 @@ def main():
                 continue
 
             frame_index += 1
-            detect_frame = extract_frame(frame, width, height, args)
-
-            # 对每帧执行矩形检测
-            rects = detect_candidates(args, frame, detect_frame, width, height, yolo_detector, frame_index)
+            detect_frame = extract_frame(frame, output_width, output_height, args)
             h, w = detect_frame.shape[:2]
-            best = rect_selector.update(rects, w, h)
+            if a4_mode:
+                a4_tracker.set_require_red_rings(a4_settings.get_require_red_rings())
+                a4_detection_cycle = a4_tracker.needs_global_detection(frame_index)
+                if a4_detection_cycle:
+                    base_rects = detect_candidates(
+                        args,
+                        frame,
+                        detect_frame,
+                        output_width,
+                        output_height,
+                        yolo_detector,
+                        frame_index,
+                    )
+                    black_rects = (
+                        find_black_band_candidates(detect_frame, a4_tracker.config)
+                        if len(base_rects) < 2
+                        else []
+                    )
+                    rects = merge_candidates(base_rects, black_rects, limit=12)
+                else:
+                    rects = []
+            else:
+                rects = detect_candidates(
+                    args,
+                    frame,
+                    detect_frame,
+                    output_width,
+                    output_height,
+                    yolo_detector,
+                    frame_index,
+                )
+
+            target_track = None
+            a4_result = None
+            laser_track = None
+            aim_status = None
+            vision_stage = None
+            vision_error = (0.0, 0.0)
+            if competition_mode:
+                if a4_mode:
+                    a4_result = a4_tracker.update(
+                        detect_frame,
+                        rects,
+                        detection_cycle=a4_detection_cycle,
+                    )
+                    if a4_result.detection is not None:
+                        target_track = TrackedTarget(
+                            rect=detection_as_rect(a4_result.detection),
+                            current=a4_result.current,
+                            held=not a4_result.current,
+                            miss_count=a4_result.miss_count,
+                        )
+                else:
+                    target_track = target_tracker.update(rects, w, h)
+                best = target_track.rect if target_track is not None else None
+                aim_status = aim_gate.update(target_track, w, h)
+                laser_track = laser_tracker.update(
+                    detect_frame,
+                    target_track,
+                    enabled=aim_status.ready,
+                )
+                vision_stage = resolve_stage(target_track, aim_status, laser_track)
+                vision_error = stage_error(vision_stage, target_track, aim_status, laser_track)
+            else:
+                best = rect_selector.update(rects, w, h)
 
             # 计算实际处理 FPS（1 秒窗口），避免启动阶段或显示阻塞造成长期误导。
             now = time.time()
@@ -1226,7 +1779,14 @@ def main():
                 fps_window_start = now
 
             # PID 控制：将目标中心追踪到屏幕中心，输出 yaw/pitch rpm
-            target_center = best.center if best is not None else None
+            if competition_mode:
+                target_center = (
+                    target_track.rect.center
+                    if target_track is not None and target_track.current
+                    else None
+                )
+            else:
+                target_center = best.center if best is not None else None
             ret, ctrl_out = tracker.update(frame_w=w, frame_h=h, target_center=target_center, dt=max(dt, 1e-6), now=now)
             if ret:
                 serial.send_rpm(ctrl_out.yaw_rpm, ctrl_out.pitch_rpm)
@@ -1234,20 +1794,71 @@ def main():
             should_refresh_display = display and frame_index % int(args.display_every) == 0
             should_refresh_stream = streamer is not None and frame_index % int(args.stream_every) == 0
             if should_refresh_stream:
-                stream_frame = make_display_frame(frame, detect_frame, width, height, args, float(args.stream_scale))
+                stream_frame = make_display_frame(
+                    frame,
+                    detect_frame,
+                    output_width,
+                    output_height,
+                    args,
+                    float(args.stream_scale),
+                )
                 stream_h, stream_w = stream_frame.shape[:2]
                 stream_best = scale_detected_rect(best, stream_w / w, stream_h / h)
-                draw_overlay(stream_frame, stream_best, ctrl_out, fps, stream_w, stream_h)
+                stream_competition = make_competition_overlay(
+                    target_track,
+                    laser_track,
+                    aim_status,
+                    vision_stage,
+                    vision_error,
+                    w,
+                    h,
+                    float(args.aim_enter_radius_ratio),
+                    stream_w / w,
+                    stream_h / h,
+                    a4_result=a4_result,
+                    a4_require_red_rings=a4_settings.get_require_red_rings(),
+                )
+                draw_overlay(
+                    stream_frame,
+                    stream_best,
+                    ctrl_out,
+                    fps,
+                    stream_w,
+                    stream_h,
+                    competition=stream_competition,
+                )
                 streamer.update(stream_frame)
 
             if should_refresh_display:
-                display_frame = make_display_frame(frame, detect_frame, width, height, args)
-                draw_overlay(display_frame, best, ctrl_out, fps, w, h)
+                display_frame = make_display_frame(
+                    frame, detect_frame, output_width, output_height, args
+                )
+                display_competition = make_competition_overlay(
+                    target_track,
+                    laser_track,
+                    aim_status,
+                    vision_stage,
+                    vision_error,
+                    w,
+                    h,
+                    float(args.aim_enter_radius_ratio),
+                    a4_result=a4_result,
+                    a4_require_red_rings=a4_settings.get_require_red_rings(),
+                )
+                draw_overlay(
+                    display_frame,
+                    best,
+                    ctrl_out,
+                    fps,
+                    w,
+                    h,
+                    competition=display_competition,
+                )
                 window_frame = scale_display_frame(display_frame, float(args.display_scale))
                 cv2.imshow(win_name, window_frame)
                 if args.print_in_display and (args.print_interval <= 0 or (now - last_print) >= args.print_interval):
                     last_print = now
-                    print_status(fps, best, ctrl_out)
+                    print_status(fps, best, ctrl_out, a4_result)
                 key = cv2.waitKey(1) & 0xFF
                 # 按 'q' 或 ESC 退出
                 if key == ord('q') or key == 27:
@@ -1257,7 +1868,15 @@ def main():
                 # 无窗口：终端输出 FPS + 检测结果（按间隔打印，避免刷屏）
                 if args.print_interval <= 0 or (now - last_print) >= args.print_interval:
                     last_print = now
-                    print_status(fps, best, ctrl_out)
+                    print_status(fps, best, ctrl_out, a4_result)
+
+            if frame_period > 0.0:
+                next_frame_deadline += frame_period
+                delay = next_frame_deadline - time.monotonic()
+                if delay > 0.0:
+                    time.sleep(delay)
+                else:
+                    next_frame_deadline = time.monotonic()
 
     except KeyboardInterrupt:
         print('\n收到中断，退出...')
