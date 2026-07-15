@@ -46,6 +46,8 @@ from vision.competition_vision import (
     resolve_stage,
     stage_error,
 )
+from vision.e25_laser import E25LaserTracker
+from vision.e25_pipeline import E25PipelineConfig, E25VisionPipeline
 from vision.rect_detect import (
     DetectedRect,
     RectSelectionConfig,
@@ -95,6 +97,7 @@ DEFAULT_A4_ACQUIRE_CONFIDENCE = 0.72
 DEFAULT_A4_TRACK_CONFIDENCE = 0.52
 DEFAULT_A4_OCCLUSION_FRAMES = 20
 DEFAULT_A4_REQUIRE_RED_RINGS = 1
+DEFAULT_E25_TARGET = 0
 DEFAULT_DETECTOR = "rect"
 DEFAULT_YOLO_SCALE = 0.33
 DEFAULT_YOLO_EVERY = 1
@@ -292,6 +295,8 @@ def parse_args():
                    help=f'A4部分遮挡最大保持帧数（默认 {DEFAULT_A4_OCCLUSION_FRAMES}）')
     p.add_argument('--a4-require-red-rings', type=int, choices=[0, 1], default=DEFAULT_A4_REQUIRE_RED_RINGS,
                    help='A4首次锁定是否要求红色圆环结构（0/1）')
+    p.add_argument('--e25-target', type=int, choices=[0, 1], default=DEFAULT_E25_TARGET,
+                   help='启用E25模型化A4四边测量、动静预测和毫米坐标链路（0/1）')
     p.add_argument('--detector', choices=['rect', 'yolo', 'hybrid'], default=DEFAULT_DETECTOR,
                    help=f'检测器：rect 传统CV，yolo 外部NPU/YOLO，hybrid YOLO优先传统CV兜底（默认 {DEFAULT_DETECTOR}）')
     p.add_argument('--yolo-command', type=str, default='',
@@ -579,6 +584,8 @@ def make_competition_overlay(
         return overlay
 
     detection = a4_result.detection
+    is_e25 = hasattr(a4_result, "confidence")
+    overlay["target_model"] = "e25" if is_e25 else "a4"
     overlay["a4_state"] = a4_result.state.value
     overlay["a4_require_red_rings"] = bool(a4_require_red_rings)
     overlay["a4_current"] = a4_result.current
@@ -597,6 +604,15 @@ def make_competition_overlay(
     )
     overlay["a4_canonical"] = None if detection is None else detection.canonical
     overlay["a4_error_mm"] = None
+    overlay["e25_identity"] = 0.0
+    overlay["e25_measurement"] = 0.0
+    overlay["e25_tracking"] = 0.0
+    overlay["e25_control_valid"] = False
+    if is_e25:
+        overlay["e25_identity"] = a4_result.confidence.identity
+        overlay["e25_measurement"] = a4_result.confidence.measurement
+        overlay["e25_tracking"] = a4_result.confidence.tracking
+        overlay["e25_control_valid"] = a4_result.confidence.control_valid
     if detection is not None and laser is not None and laser.current:
         laser_mm = map_image_point_to_a4(detection, laser.center)
         target_mm = a4_center_mm(detection)
@@ -766,7 +782,8 @@ def draw_overlay(
 
     cv2.putText(
         display_frame,
-        f"a4={competition['a4_state']} mode={'full' if competition['a4_require_red_rings'] else 'frame'} "
+        f"{competition.get('target_model', 'a4')}={competition['a4_state']} "
+        f"mode={'full' if competition['a4_require_red_rings'] else 'frame'} "
         f"conf={competition['a4_confidence']:.2f} "
         f"struct={competition['a4_structural']:.2f} sides={competition['a4_visible_sides']} "
         f"flow={competition['a4_flow_inliers']}",
@@ -778,8 +795,13 @@ def draw_overlay(
     )
     cv2.putText(
         display_frame,
-        f"edge={competition['a4_edge']:.2f} black={competition['a4_black']:.2f} "
-        f"red={competition['a4_red']:.2f} temporal={competition['a4_temporal']:.2f}",
+        (
+            f"id={competition['e25_identity']:.2f} meas={competition['e25_measurement']:.2f} "
+            f"track={competition['e25_tracking']:.2f} ctl={int(competition['e25_control_valid'])}"
+            if competition.get('target_model') == 'e25'
+            else f"edge={competition['a4_edge']:.2f} black={competition['a4_black']:.2f} "
+                 f"red={competition['a4_red']:.2f} temporal={competition['a4_temporal']:.2f}"
+        ),
         (10, 202),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.50,
@@ -1487,8 +1509,9 @@ def print_status(fps: float, best, ctrl_out, a4_result=None) -> None:
     a4_text = ""
     if a4_result is not None:
         confidence = 0.0 if a4_result.detection is None else a4_result.detection.confidence
+        label = "e25" if hasattr(a4_result, "confidence") else "a4"
         a4_text = (
-            f" a4={a4_result.state.value} conf={confidence:.2f} "
+            f" {label}={a4_result.state.value} conf={confidence:.2f} "
             f"flow={a4_result.flow_inliers} miss={a4_result.miss_count}"
         )
     if best is None:
@@ -1564,8 +1587,10 @@ def main():
         raise SystemExit('A4跟踪门限必须不高于首次锁定门限，且均在 0 到 1 之间')
     if args.a4_occlusion_frames < 1:
         raise SystemExit('--a4-occlusion-frames 必须大于等于 1')
-    if args.a4_target and args.detector != 'rect':
-        raise SystemExit('--a4-target 目前只支持 --detector rect，无需NPU/YOLO')
+    if args.a4_target and args.e25_target:
+        raise SystemExit('--a4-target 与 --e25-target 不能同时启用')
+    if (args.a4_target or args.e25_target) and args.detector != 'rect':
+        raise SystemExit('A4/E25模型模式目前只支持 --detector rect')
     if not 0.0 < args.display_scale <= 1.0:
         raise SystemExit('--display-scale 必须在 0 到 1 之间')
     if args.display_every < 1:
@@ -1583,7 +1608,7 @@ def main():
 
     display = bool(args.display)
     a4_settings = A4RuntimeSettings(
-        enabled=bool(args.a4_target),
+        enabled=bool(args.a4_target or args.e25_target),
         require_red_rings=bool(args.a4_require_red_rings),
     )
     streamer = None
@@ -1625,14 +1650,31 @@ def main():
         previous_weight=float(args.rect_prev_weight),
     )
     a4_mode = bool(args.a4_target)
-    competition_mode = bool(args.competition_mode or a4_mode)
+    e25_mode = bool(args.e25_target)
+    model_target_mode = a4_mode or e25_mode
+    competition_mode = bool(args.competition_mode or model_target_mode)
     rect_selector = None if competition_mode else RectSelector(selection_config)
     target_tracker = None
     a4_tracker = None
+    e25_tracker = None
     aim_gate = None
     laser_tracker = None
     if competition_mode:
-        if a4_mode:
+        if e25_mode:
+            e25_tracker = E25VisionPipeline(
+                E25PipelineConfig(
+                    min_area_ratio=float(args.a4_min_area_ratio),
+                    max_area_ratio=float(args.rect_max_area_ratio),
+                    acquire_confidence=float(args.a4_acquire_confidence),
+                    track_identity_confidence=float(args.a4_track_confidence),
+                    occlusion_hold_frames=int(args.a4_occlusion_frames),
+                    static_global_interval=int(args.a4_global_interval),
+                    search_interval=int(args.a4_search_interval),
+                    structural_validate_interval=int(args.a4_local_validate_interval),
+                ),
+                require_red_rings=a4_settings.get_require_red_rings(),
+            )
+        elif a4_mode:
             a4_tracker = A4TargetTracker(
                 A4TargetConfig(
                     min_area_ratio=float(args.a4_min_area_ratio),
@@ -1659,13 +1701,16 @@ def main():
             offset_x_ratio=float(args.aim_offset_x_ratio),
             offset_y_ratio=float(args.aim_offset_y_ratio),
         )
-        laser_tracker = HybridLaserTracker(
-            HybridLaserConfig(
-                min_dynamic_luma=int(args.laser_min_luma),
-                fallback_min_luma=int(args.laser_fallback_min_luma),
-                hold_frames=int(args.laser_hold_frames),
+        if e25_mode:
+            laser_tracker = E25LaserTracker()
+        else:
+            laser_tracker = HybridLaserTracker(
+                HybridLaserConfig(
+                    min_dynamic_luma=int(args.laser_min_luma),
+                    fallback_min_luma=int(args.laser_fallback_min_luma),
+                    hold_frames=int(args.laser_hold_frames),
+                )
             )
-        )
         print(
             'Competition vision enabled: target hold, aim gate, '
             'LAB violet + dynamic bright-core laser tracking'
@@ -1674,6 +1719,11 @@ def main():
             print(
                 'A4 target mode enabled: black-tape/red-ring structure, '
                 '64 edge points, LK homography and occlusion state machine'
+            )
+        if e25_mode:
+            print(
+                'E25 model mode enabled: global identity, per-side normal scans, '
+                'robust line fitting, motion prediction and IMX415 laser fusion'
             )
 
     win_name = f"Camera {args.device if args.backend == 'gstreamer' else args.camera}"
@@ -1701,9 +1751,10 @@ def main():
             frame_index += 1
             detect_frame = extract_frame(frame, output_width, output_height, args)
             h, w = detect_frame.shape[:2]
-            if a4_mode:
-                a4_tracker.set_require_red_rings(a4_settings.get_require_red_rings())
-                a4_detection_cycle = a4_tracker.needs_global_detection(frame_index)
+            if model_target_mode:
+                model_tracker = e25_tracker if e25_mode else a4_tracker
+                model_tracker.set_require_red_rings(a4_settings.get_require_red_rings())
+                a4_detection_cycle = model_tracker.needs_global_detection(frame_index)
                 if a4_detection_cycle:
                     base_rects = detect_candidates(
                         args,
@@ -1715,8 +1766,11 @@ def main():
                         frame_index,
                     )
                     black_rects = (
-                        find_black_band_candidates(detect_frame, a4_tracker.config)
-                        if len(base_rects) < 2
+                        find_black_band_candidates(
+                            detect_frame,
+                            model_tracker.detector.config if e25_mode else model_tracker.config,
+                        )
+                        if e25_mode or len(base_rects) < 2
                         else []
                     )
                     rects = merge_candidates(base_rects, black_rects, limit=12)
@@ -1740,12 +1794,20 @@ def main():
             vision_stage = None
             vision_error = (0.0, 0.0)
             if competition_mode:
-                if a4_mode:
-                    a4_result = a4_tracker.update(
-                        detect_frame,
-                        rects,
-                        detection_cycle=a4_detection_cycle,
-                    )
+                if model_target_mode:
+                    if e25_mode:
+                        a4_result = e25_tracker.update(
+                            detect_frame,
+                            rects,
+                            detection_cycle=a4_detection_cycle,
+                            dt=1.0 / max(float(args.fps), 1.0),
+                        )
+                    else:
+                        a4_result = a4_tracker.update(
+                            detect_frame,
+                            rects,
+                            detection_cycle=a4_detection_cycle,
+                        )
                     if a4_result.detection is not None:
                         target_track = TrackedTarget(
                             rect=detection_as_rect(a4_result.detection),
@@ -1760,7 +1822,11 @@ def main():
                 laser_track = laser_tracker.update(
                     detect_frame,
                     target_track,
-                    enabled=aim_status.ready,
+                    enabled=(
+                        target_track is not None and target_track.current
+                        if e25_mode
+                        else aim_status.ready
+                    ),
                 )
                 vision_stage = resolve_stage(target_track, aim_status, laser_track)
                 vision_error = stage_error(vision_stage, target_track, aim_status, laser_track)
@@ -1780,11 +1846,27 @@ def main():
 
             # PID 控制：将目标中心追踪到屏幕中心，输出 yaw/pitch rpm
             if competition_mode:
-                target_center = (
-                    target_track.rect.center
-                    if target_track is not None and target_track.current
-                    else None
+                target_center = None
+                target_is_valid = (
+                    target_track is not None
+                    and target_track.current
+                    and (
+                        not e25_mode
+                        or (a4_result is not None and a4_result.confidence.control_valid)
+                    )
                 )
+                if target_is_valid:
+                    target_center = target_track.rect.center
+                    if (
+                        e25_mode
+                        and vision_stage == VisionStage.ALIGN_LASER
+                        and laser_track is not None
+                        and laser_track.current
+                    ):
+                        target_center = (
+                            0.5 * w + vision_error[0],
+                            0.5 * h + vision_error[1],
+                        )
             else:
                 target_center = best.center if best is not None else None
             ret, ctrl_out = tracker.update(frame_w=w, frame_h=h, target_center=target_center, dt=max(dt, 1e-6), now=now)

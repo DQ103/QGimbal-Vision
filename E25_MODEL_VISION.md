@@ -1,0 +1,103 @@
+# E25 Model-Based Vision Branch
+
+This branch implements the non-NPU vision path for the 2025 E problem target on
+Radxa Cubie A7A and IMX415. The main path treats the target as a known A4 plane,
+not as an arbitrary rectangle.
+
+## Runtime Architecture
+
+1. Global discovery finds candidate quadrilaterals and black tape contours.
+2. The A4 detector verifies edge, black-band, pose, temporal, and optional red-ring evidence.
+3. Sixteen normal profiles per side measure the black tape inner transition and recover the outer edge.
+4. Huber line fitting rejects local outliers and reconstructs the quad when at least three sides remain visible.
+5. An alpha-beta predictor switches between dynamic and static gains and predicts the next target position.
+6. The homography maps image points to the 210 x 297 mm target plane.
+7. Laser tracking combines blue-channel, HSV, LAB, bright-core, size, and temporal evidence.
+8. PID output is allowed only when identity, measurement, and tracking confidence all pass their gates.
+
+The web overlay exposes four independent status values:
+
+- `id`: target identity confidence.
+- `meas`: current edge measurement quality.
+- `track`: temporal consistency.
+- `ctl`: whether the current measurement is allowed to drive the gimbal.
+
+When the target is centered and the laser is visible, the PID error changes from
+camera-to-target alignment to `target center - laser center`. Predicted or held
+geometry never drives the PID.
+
+## A7A Launch
+
+On the board:
+
+```bash
+cd ~/QGimbal-Vision-e25
+scripts/run_a7a_imx415_e25_web.sh
+```
+
+Default preview URLs:
+
+```text
+http://192.168.0.98:8081/
+http://100.70.110.24:8081/
+```
+
+The launcher keeps the tested IMX415 path: AWISP BGR output at 960 x 540, 30 Hz,
+single-frame leaky queues, detection at half scale, and full-resolution local edge
+measurement. Web JPEG generation remains outside target measurement and can be
+reduced with `E25_STREAM_EVERY=2` if CPU load affects capture.
+
+Useful overrides:
+
+```bash
+E25_REQUIRE_RED_RINGS=1 scripts/run_a7a_imx415_e25_web.sh
+E25_ACQUIRE_CONFIDENCE=0.64 scripts/run_a7a_imx415_e25_web.sh
+STREAM_PORT=8083 CONTROL=1 scripts/run_a7a_imx415_e25_web.sh
+```
+
+The web page also provides a live `Require red rings` switch. Keep it disabled for
+plain black-frame test paper and enable it for the complete competition target.
+
+## Recording And Replay
+
+Record a reproducible camera sequence on the A7A:
+
+```bash
+python3 tools/record_e25_dataset.py datasets/e25/partial_occlusion.avi \
+  --seconds 30 --label partial-occlusion
+```
+
+Replay it on either machine and write an annotated result:
+
+```bash
+python3 tools/replay_e25_dataset.py datasets/e25/partial_occlusion.avi \
+  --output datasets/e25/partial_occlusion_result.avi
+```
+
+Use separate clips for static target, fast pan, one-side occlusion, two-side
+occlusion, background distractors, warm glare, and moving laser.
+
+## Control Contract
+
+The existing `GimbalSerialStub` still sends RPM packets to the STM32. E25 mode
+gates those packets with `control_valid` and changes to laser error after alignment.
+
+`control/e25_protocol.py` defines an optional ASCII telemetry packet for a future
+separate status channel:
+
+```text
+@E25,sequence,target_valid,laser_valid,control_valid,error_x_mm,error_y_mm,identity,measurement,tracking\r\n
+```
+
+Do not multiplex this ASCII telemetry onto the current binary RPM serial stream.
+
+## Current Boundary
+
+The predictor currently learns image-plane velocity. Encoder-derived prediction
+still requires an STM32 timestamp, angle/rate protocol plus camera intrinsics and
+gimbal-to-camera calibration. That hardware contract is intentionally not guessed
+in this branch; it should be added as a measured external shift before prediction.
+
+NPU inference is not used in the control path. It can later be added only as a
+low-rate global reacquisition source; final corners, target center, laser error,
+and control validity remain geometry-based.
