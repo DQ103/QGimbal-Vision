@@ -15,6 +15,7 @@ from .a4_target import (
     order_quad_points,
     quad_center,
 )
+from .e25_coarse_motion import E25CoarseMotionTracker
 from .e25_edge_tracker import E25EdgeConfig, E25EdgeTracker, EdgeMeasurement
 from .e25_motion import AlphaBetaMotionPredictor, MotionMode
 from .e25_target_model import DEFAULT_E25_TARGET_MODEL, E25TargetModel
@@ -50,12 +51,15 @@ class E25PipelineConfig:
     acquire_confidence: float = 0.72
     track_identity_confidence: float = 0.48
     acquire_confirm_frames: int = 3
-    occlusion_hold_frames: int = 12
+    recovery_hold_frames: int = 24
+    max_prediction_frames: int = 4
     search_interval: int = 6
     static_global_interval: int = 15
-    dynamic_global_interval: int = 5
+    dynamic_global_interval: int = 2
     structural_validate_interval: int = 5
     min_measurement_quality: float = 0.38
+    coarse_min_confidence: float = 0.42
+    dynamic_edge_search_scale: float = 2.0
 
 
 class E25VisionPipeline:
@@ -78,10 +82,14 @@ class E25VisionPipeline:
             )
         )
         self.edge_tracker = E25EdgeTracker(E25EdgeConfig(), model)
+        self.coarse_motion = E25CoarseMotionTracker()
         self.motion = AlphaBetaMotionPredictor()
         self.require_red_rings = bool(require_red_rings)
         self.state = A4TrackState.SEARCH
         self.current: Optional[A4Detection] = None
+        self.reliable: Optional[A4Detection] = None
+        self.coarse_quad: Optional[np.ndarray] = None
+        self.prediction_age = 0
         self.identity_confidence = 0.0
         self.measurement_quality = 0.0
         self.tracking_confidence = 0.0
@@ -95,6 +103,9 @@ class E25VisionPipeline:
     def reset(self) -> None:
         self.state = A4TrackState.SEARCH
         self.current = None
+        self.reliable = None
+        self.coarse_quad = None
+        self.prediction_age = 0
         self.identity_confidence = 0.0
         self.measurement_quality = 0.0
         self.tracking_confidence = 0.0
@@ -105,6 +116,7 @@ class E25VisionPipeline:
         self.miss_count = 0
         self.frame_count = 0
         self.motion.reset()
+        self.coarse_motion.reset()
 
     def set_require_red_rings(self, require_red_rings: bool) -> None:
         require_red_rings = bool(require_red_rings)
@@ -115,6 +127,8 @@ class E25VisionPipeline:
     def needs_global_detection(self, frame_index: int) -> bool:
         if self.current is None or self.state in (A4TrackState.SEARCH, A4TrackState.LOST):
             return (frame_index - 1) % self.config.search_interval == 0
+        if self.state == A4TrackState.OCCLUDED:
+            return True
         interval = (
             self.config.dynamic_global_interval
             if self.motion.mode == MotionMode.DYNAMIC
@@ -134,7 +148,11 @@ class E25VisionPipeline:
         if detection_cycle:
             global_detections = [
                 self._rescore_detection(detection)
-                for detection in self.detector.detect(frame, candidates, self.current)
+                for detection in self.detector.detect(
+                    frame,
+                    candidates,
+                    self.reliable or self.current,
+                )
             ]
 
         if self.current is None:
@@ -143,15 +161,54 @@ class E25VisionPipeline:
                 global_detections[0] if global_detections else None,
             )
             return self._update_search(
+                frame,
                 search_candidate,
                 detection_cycle,
             )
 
-        predicted_quad = self.motion.predict_quad(self.current.quad, dt)
-        base = self.current
-        associated = self._associated_detection(global_detections, predicted_quad)
+        base = self.reliable or self.current
+        if self.coarse_quad is None:
+            self.coarse_quad = base.quad.copy()
+        coarse = self.coarse_motion.estimate(frame, self.coarse_quad)
+        coarse_valid = (
+            coarse.quad is not None
+            and coarse.confidence >= self.config.coarse_min_confidence
+        )
+        coarse_motion_active = coarse_valid and (
+            math.hypot(coarse.shift[0], coarse.shift[1]) >= 2.5
+            or abs(coarse.scale - 1.0) >= 0.012
+            or abs(coarse.rotation_deg) >= 0.8
+        )
+        dynamic_tracking = (
+            coarse_motion_active
+            or self.motion.mode == MotionMode.DYNAMIC
+            or self.state == A4TrackState.OCCLUDED
+            or self.prediction_age > 0
+        )
+        if coarse_valid:
+            predicted_quad = coarse.quad
+            self.coarse_quad = coarse.quad.copy()
+        else:
+            prediction_horizon = min(
+                self.prediction_age + 1,
+                self.config.max_prediction_frames,
+            )
+            predicted_quad = _bounded_motion_prediction(
+                base.quad,
+                self.motion,
+                dt,
+                prediction_horizon,
+            )
+
+        associated = self._associated_detection(
+            global_detections,
+            predicted_quad,
+            recovering=dynamic_tracking,
+        )
+        if associated is not None and dynamic_tracking and not self._recovery_ok(associated):
+            associated = None
         if associated is not None and associated.confidence >= self.config.track_identity_confidence:
-            alpha = 0.55 if self.motion.mode == MotionMode.DYNAMIC else 0.30
+            alpha = 0.88 if dynamic_tracking else 0.30
             blended_quad = (
                 (1.0 - alpha) * order_quad_points(predicted_quad)
                 + alpha * order_quad_points(associated.quad)
@@ -164,7 +221,7 @@ class E25VisionPipeline:
                     area=float(abs(cv2.contourArea(blended_quad))),
                     pass_index=-3,
                 ),
-                self.current,
+                self.reliable or self.current,
             )
             if evaluated is not None:
                 base = self._rescore_detection(evaluated)
@@ -175,23 +232,51 @@ class E25VisionPipeline:
             frame,
             predicted_quad,
             base.canonical_size,
+            search_scale=(
+                self.config.dynamic_edge_search_scale
+                if dynamic_tracking
+                else 1.0
+            ),
         )
-        if (
+        measurement_valid = (
             edge_measurement.quad is not None
             and edge_measurement.visible_sides >= 3
             and edge_measurement.quality >= self.config.min_measurement_quality
-        ):
+        )
+        if measurement_valid:
             measured = _reproject_detection(
                 base,
                 edge_measurement.quad,
                 edge_measurement.edge_points,
                 edge_measurement.visible_sides,
             )
-            if self.frame_count % self.config.structural_validate_interval == 0:
-                validated = self.detector.evaluate(frame, measured.rect, self.current)
+            measurement_valid = _measurement_is_plausible(
+                measured.quad,
+                predicted_quad,
+                (self.reliable or base).quad,
+                dynamic_tracking,
+            )
+
+        if measurement_valid:
+            validation_ok = True
+            validate_now = (
+                dynamic_tracking
+                or self.frame_count % self.config.structural_validate_interval == 0
+            )
+            if validate_now:
+                validated = self.detector.evaluate(
+                    frame,
+                    measured.rect,
+                    self.reliable or self.current,
+                )
                 if validated is not None:
                     validated = self._rescore_detection(validated)
-                    if validated.confidence >= self.config.track_identity_confidence:
+                    validation_ok = (
+                        self._recovery_ok(validated)
+                        if dynamic_tracking
+                        else validated.confidence >= self.config.track_identity_confidence
+                    )
+                    if validation_ok:
                         measured = _reproject_detection(
                             validated,
                             edge_measurement.quad,
@@ -202,10 +287,15 @@ class E25VisionPipeline:
                     else:
                         self.identity_confidence *= 0.94
                 else:
+                    validation_ok = False
                     self.identity_confidence *= 0.94
             else:
                 self.identity_confidence *= 0.998
 
+            if dynamic_tracking and not validation_ok:
+                measurement_valid = False
+
+        if measurement_valid:
             estimate = self.motion.update(
                 measured.center,
                 dt,
@@ -230,16 +320,60 @@ class E25VisionPipeline:
                 self.tracking_confidence,
             )
             self.current = measured
+            self.reliable = measured
+            self.coarse_quad = measured.quad.copy()
+            self.coarse_motion.reset(frame, measured.quad)
             self.state = A4TrackState.TRACKING
             self.miss_count = 0
+            self.prediction_age = 0
             return self._result(measured, True, False, edge_measurement, control_valid)
 
+        if associated is not None and self._recovery_ok(associated):
+            estimate = self.motion.update(
+                associated.center,
+                dt,
+                quality=max(0.55, associated.scores.edge),
+            )
+            self.identity_confidence = max(
+                self.identity_confidence * 0.80,
+                associated.confidence,
+            )
+            self.measurement_quality = associated.scores.edge
+            self.tracking_confidence = max(
+                0.58,
+                _tracking_quality(
+                    estimate.residual,
+                    associated.area,
+                    associated.scores.visible_sides,
+                ),
+            )
+            recovered = _with_combined_confidence(
+                associated,
+                self.identity_confidence,
+                self.measurement_quality,
+                self.tracking_confidence,
+            )
+            self.current = recovered
+            self.reliable = recovered
+            self.coarse_quad = recovered.quad.copy()
+            self.coarse_motion.reset(frame, recovered.quad)
+            self.state = A4TrackState.ACQUIRED
+            self.miss_count = 0
+            self.prediction_age = 0
+            return self._result(recovered, True, False, edge_measurement, False)
+
         self.miss_count += 1
+        self.prediction_age += 1
         self.identity_confidence *= 0.985
         self.measurement_quality *= 0.70
         self.tracking_confidence *= 0.82
-        if self.miss_count <= self.config.occlusion_hold_frames:
-            predicted = _reproject_detection(base, predicted_quad, (), 0)
+        if self.miss_count <= self.config.recovery_hold_frames:
+            display_quad = (
+                predicted_quad
+                if self.prediction_age <= self.config.max_prediction_frames
+                else (self.reliable or base).quad
+            )
+            predicted = _reproject_detection(base, display_quad, (), 0)
             predicted = _with_combined_confidence(
                 predicted,
                 self.identity_confidence,
@@ -247,6 +381,7 @@ class E25VisionPipeline:
                 self.tracking_confidence,
             )
             self.current = predicted
+            self.coarse_quad = display_quad.copy()
             self.state = A4TrackState.OCCLUDED
             return self._result(predicted, False, True, edge_measurement, False)
 
@@ -270,6 +405,7 @@ class E25VisionPipeline:
 
     def _update_search(
         self,
+        frame: np.ndarray,
         best: Optional[A4Detection],
         detection_cycle: bool,
     ) -> E25TrackResult:
@@ -305,12 +441,16 @@ class E25VisionPipeline:
             return self._result(best, False, False, None, False)
 
         self.current = best
+        self.reliable = best
+        self.coarse_quad = best.quad.copy()
         self.identity_confidence = best.confidence
         self.measurement_quality = best.scores.edge
         self.tracking_confidence = 0.75
         self.motion.reset(best.center)
+        self.coarse_motion.reset(frame, best.quad)
         self.state = A4TrackState.ACQUIRED
         self.miss_count = 0
+        self.prediction_age = 0
         self.pending = None
         self.pending_count = 0
         self.pending_miss_count = 0
@@ -358,6 +498,7 @@ class E25VisionPipeline:
         self,
         detections: Sequence[A4Detection],
         predicted_quad: np.ndarray,
+        recovering: bool = False,
     ) -> Optional[A4Detection]:
         predicted_center = quad_center(predicted_quad)
         predicted_area = abs(float(cv2.contourArea(predicted_quad.astype(np.float32))))
@@ -378,13 +519,29 @@ class E25VisionPipeline:
                     )
                 )
             )
+            center_ratio = 0.52 if recovering else 0.18
+            corner_ratio = 0.48 if recovering else 0.20
+            min_area_ratio = 0.42 if recovering else 0.58
             if (
-                center_distance <= max(24.0, 0.18 * scale)
-                and area_ratio >= 0.58
-                and corner_rms <= max(28.0, 0.20 * scale)
+                center_distance <= max(24.0, center_ratio * scale)
+                and area_ratio >= min_area_ratio
+                and corner_rms <= max(28.0, corner_ratio * scale)
             ):
                 return detection
         return None
+
+    def _recovery_ok(self, detection: A4Detection) -> bool:
+        if detection.confidence < self.config.track_identity_confidence:
+            return False
+        if detection.scores.visible_sides < 3:
+            return False
+        if detection.scores.edge < 0.48 or detection.scores.black_band < 0.44:
+            return False
+        if _paper_surface_score(detection.canonical) < 0.42:
+            return False
+        if self.require_red_rings and detection.scores.red_rings < 0.20:
+            return False
+        return True
 
     def _result(
         self,
@@ -467,6 +624,69 @@ def _tracking_quality(residual: float, area: float, visible_sides: int) -> float
     residual_score = 1.0 - min(1.0, float(residual) / max(8.0, 0.045 * scale))
     side_score = min(1.0, visible_sides / 4.0)
     return max(0.0, min(1.0, 0.72 * residual_score + 0.28 * side_score))
+
+
+def _bounded_motion_prediction(
+    reliable_quad: np.ndarray,
+    motion: AlphaBetaMotionPredictor,
+    dt: float,
+    horizon_frames: int,
+) -> np.ndarray:
+    reliable_quad = order_quad_points(reliable_quad)
+    horizon = max(1, int(horizon_frames))
+    shift = motion.velocity.astype(np.float32) * max(float(dt), 0.0) * horizon
+    scale = max(math.sqrt(abs(float(cv2.contourArea(reliable_quad)))), 1.0)
+    max_shift = max(18.0, 0.38 * scale)
+    magnitude = float(np.linalg.norm(shift))
+    if magnitude > max_shift:
+        shift *= max_shift / max(magnitude, 1e-6)
+    return reliable_quad + shift.reshape(1, 2)
+
+
+def _measurement_is_plausible(
+    measured_quad: np.ndarray,
+    predicted_quad: np.ndarray,
+    reliable_quad: np.ndarray,
+    dynamic: bool,
+) -> bool:
+    measured = order_quad_points(measured_quad)
+    predicted = order_quad_points(predicted_quad)
+    reliable = order_quad_points(reliable_quad)
+    if not cv2.isContourConvex(measured.astype(np.float32)):
+        return False
+    measured_area = abs(float(cv2.contourArea(measured)))
+    predicted_area = abs(float(cv2.contourArea(predicted)))
+    reliable_area = abs(float(cv2.contourArea(reliable)))
+    if min(measured_area, predicted_area, reliable_area) <= 1.0:
+        return False
+    area_ratio = min(measured_area, predicted_area) / max(measured_area, predicted_area)
+    min_area_ratio = 0.44 if dynamic else 0.62
+    if area_ratio < min_area_ratio:
+        return False
+
+    scale = max(math.sqrt(reliable_area), 1.0)
+    predicted_center = quad_center(predicted)
+    measured_center = quad_center(measured)
+    reliable_center = quad_center(reliable)
+    prediction_error = math.hypot(
+        measured_center[0] - predicted_center[0],
+        measured_center[1] - predicted_center[1],
+    )
+    reliable_jump = math.hypot(
+        measured_center[0] - reliable_center[0],
+        measured_center[1] - reliable_center[1],
+    )
+    corner_rms = float(
+        np.sqrt(np.mean(np.sum((measured - predicted) ** 2, axis=1)))
+    )
+    prediction_ratio = 0.34 if dynamic else 0.14
+    reliable_ratio = 0.62 if dynamic else 0.22
+    corner_ratio = 0.42 if dynamic else 0.18
+    return (
+        prediction_error <= max(20.0, prediction_ratio * scale)
+        and reliable_jump <= max(28.0, reliable_ratio * scale)
+        and corner_rms <= max(24.0, corner_ratio * scale)
+    )
 
 
 def _detections_match(first: A4Detection, second: A4Detection) -> bool:

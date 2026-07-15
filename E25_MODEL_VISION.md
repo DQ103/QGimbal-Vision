@@ -17,6 +17,14 @@ not as an arbitrary rectangle.
 7. Laser tracking combines blue-channel, HSV, LAB, bright-core, size, and temporal evidence.
 8. PID output is allowed only when identity, measurement, and tracking confidence all pass their gates.
 
+Fast-recovery tracking adds a low-resolution frame-difference gate followed by
+LK optical flow and RANSAC similarity estimation only on moving frames. The
+result moves the edge-search seed; it never directly enables control. Yellow
+prediction is anchored to the last reliable green quad, is allowed to extrapolate
+for four frames, then freezes while global recovery runs every frame. A structurally
+associated target can return immediately without repeating the three-frame cold-start
+confirmation.
+
 The web overlay exposes four independent status values:
 
 - `id`: target identity confidence.

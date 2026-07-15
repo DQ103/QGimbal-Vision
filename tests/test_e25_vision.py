@@ -4,6 +4,7 @@ import numpy as np
 from control.e25_protocol import E25ControlPacket
 from vision.a4_target import A4TrackState, order_quad_points, quad_center
 from vision.competition_vision import TrackedTarget
+from vision.e25_coarse_motion import E25CoarseMotionTracker
 from vision.e25_edge_tracker import E25EdgeTracker
 from vision.e25_laser import E25LaserTracker
 from vision.e25_motion import AlphaBetaMotionPredictor, MotionMode
@@ -63,6 +64,28 @@ def test_motion_predictor_switches_dynamic_then_returns_static() -> None:
     assert estimate.mode == MotionMode.STATIC
 
 
+def test_coarse_motion_estimates_large_translation() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    shifted = quad + np.array([75.0, -30.0], dtype=np.float32)
+    target = make_target()
+    tracker = E25CoarseMotionTracker()
+    tracker.reset(project_target(target, quad), quad)
+
+    estimate = tracker.estimate(project_target(target, shifted), quad)
+
+    assert estimate.quad is not None
+    assert estimate.inliers >= 6
+    error = np.sqrt(
+        np.mean(
+            np.sum(
+                (order_quad_points(estimate.quad) - order_quad_points(shifted)) ** 2,
+                axis=1,
+            )
+        )
+    )
+    assert error < 8.0
+
+
 def test_edge_tracker_refines_shifted_prediction() -> None:
     quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
     frame = project_target(make_target(), quad)
@@ -109,6 +132,115 @@ def test_pipeline_acquires_and_tracks_translation() -> None:
     assert tracked.detection is not None
     assert tracked.confidence.measurement >= 0.38
     assert np.linalg.norm(np.asarray(tracked.detection.center) - np.asarray(quad_center(shifted))) < 8.0
+
+
+def test_pipeline_tracks_single_frame_fast_translation() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    shifted = quad + np.array([75.0, -30.0], dtype=np.float32)
+    target = make_target()
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=1,
+        ),
+        require_red_rings=False,
+    )
+    pipeline.update(project_target(target, quad), [candidate(quad)], detection_cycle=True)
+
+    tracked = pipeline.update(project_target(target, shifted), [], detection_cycle=False)
+
+    assert tracked.state == A4TrackState.TRACKING
+    assert tracked.current and not tracked.predicted
+    assert tracked.detection is not None
+    assert np.linalg.norm(
+        np.asarray(tracked.detection.center) - np.asarray(quad_center(shifted))
+    ) < 10.0
+
+
+def test_pipeline_recovers_next_frame_after_extreme_translation() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    shifted = quad + np.array([150.0, -40.0], dtype=np.float32)
+    target = make_target()
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=1,
+        ),
+        require_red_rings=False,
+    )
+    pipeline.update(project_target(target, quad), [candidate(quad)], detection_cycle=True)
+    shifted_frame = project_target(target, shifted)
+
+    held = pipeline.update(shifted_frame, [], detection_cycle=False)
+    recovered = pipeline.update(shifted_frame, [candidate(shifted)], detection_cycle=True)
+
+    assert held.state == A4TrackState.OCCLUDED
+    assert held.predicted and not held.current
+    assert recovered.state in (A4TrackState.ACQUIRED, A4TrackState.TRACKING)
+    assert recovered.current and recovered.detection is not None
+    assert np.linalg.norm(
+        np.asarray(recovered.detection.center) - np.asarray(quad_center(shifted))
+    ) < 10.0
+
+
+def test_pipeline_prediction_freezes_instead_of_recursively_drifting() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    shifted = quad + np.array([18.0, 5.0], dtype=np.float32)
+    target = make_target()
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=1,
+            max_prediction_frames=4,
+            recovery_hold_frames=20,
+        ),
+        require_red_rings=False,
+    )
+    pipeline.update(project_target(target, quad), [candidate(quad)], detection_cycle=True)
+    reliable = pipeline.update(project_target(target, shifted), [], detection_cycle=False)
+    assert reliable.current and reliable.detection is not None
+    reliable_center = np.asarray(reliable.detection.center)
+    blank = np.full((540, 960, 3), 150, dtype=np.uint8)
+
+    centers = []
+    for _ in range(12):
+        held = pipeline.update(blank, [], detection_cycle=False)
+        assert held.state == A4TrackState.OCCLUDED
+        assert held.detection is not None and not held.current
+        centers.append(np.asarray(held.detection.center))
+
+    assert np.linalg.norm(centers[-1] - centers[-2]) < 0.1
+    assert np.linalg.norm(centers[-1] - reliable_center) < 150.0
+
+
+def test_fast_recovery_does_not_switch_to_saturated_distractor() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    distractor_quad = quad + np.array([80.0, -15.0], dtype=np.float32)
+    target = make_target()
+    orange_target = make_target()
+    orange_target[36:-36, 36:-36] = (34, 61, 132)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=1,
+        ),
+        require_red_rings=False,
+    )
+    pipeline.update(project_target(target, quad), [candidate(quad)], detection_cycle=True)
+
+    result = pipeline.update(
+        project_target(orange_target, distractor_quad),
+        [candidate(distractor_quad)],
+        detection_cycle=True,
+    )
+
+    assert result.state == A4TrackState.OCCLUDED
+    assert not result.current
+    assert not result.confidence.control_valid
 
 
 def test_pipeline_preserves_acquisition_across_sparse_detection_cycles() -> None:

@@ -99,6 +99,9 @@ DEFAULT_A4_TRACK_CONFIDENCE = 0.52
 DEFAULT_A4_OCCLUSION_FRAMES = 20
 DEFAULT_A4_REQUIRE_RED_RINGS = 1
 DEFAULT_E25_TARGET = 0
+DEFAULT_E25_RECOVERY_FRAMES = 24
+DEFAULT_E25_MAX_PREDICTION_FRAMES = 4
+DEFAULT_E25_DYNAMIC_EDGE_SCALE = 2.0
 DEFAULT_DETECTOR = "rect"
 DEFAULT_YOLO_SCALE = 0.33
 DEFAULT_YOLO_EVERY = 1
@@ -298,6 +301,12 @@ def parse_args():
                    help='A4首次锁定是否要求红色圆环结构（0/1）')
     p.add_argument('--e25-target', type=int, choices=[0, 1], default=DEFAULT_E25_TARGET,
                    help='启用E25模型化A4四边测量、动静预测和毫米坐标链路（0/1）')
+    p.add_argument('--e25-recovery-frames', type=int, default=DEFAULT_E25_RECOVERY_FRAMES,
+                   help=f'E25黄框快速恢复状态最大保持帧数（默认 {DEFAULT_E25_RECOVERY_FRAMES}）')
+    p.add_argument('--e25-max-prediction-frames', type=int, default=DEFAULT_E25_MAX_PREDICTION_FRAMES,
+                   help=f'E25丢测量后允许继续外推的最大帧数（默认 {DEFAULT_E25_MAX_PREDICTION_FRAMES}）')
+    p.add_argument('--e25-dynamic-edge-scale', type=float, default=DEFAULT_E25_DYNAMIC_EDGE_SCALE,
+                   help=f'E25动态状态法线搜索范围倍率（默认 {DEFAULT_E25_DYNAMIC_EDGE_SCALE}）')
     p.add_argument('--detector', choices=['rect', 'yolo', 'hybrid'], default=DEFAULT_DETECTOR,
                    help=f'检测器：rect 传统CV，yolo 外部NPU/YOLO，hybrid YOLO优先传统CV兜底（默认 {DEFAULT_DETECTOR}）')
     p.add_argument('--yolo-command', type=str, default='',
@@ -1590,6 +1599,12 @@ def main():
         raise SystemExit('--a4-occlusion-frames 必须大于等于 1')
     if args.a4_target and args.e25_target:
         raise SystemExit('--a4-target 与 --e25-target 不能同时启用')
+    if args.e25_recovery_frames < 1:
+        raise SystemExit('--e25-recovery-frames 必须大于等于 1')
+    if not 0 <= args.e25_max_prediction_frames <= args.e25_recovery_frames:
+        raise SystemExit('--e25-max-prediction-frames 必须在 0 到恢复帧数之间')
+    if not 1.0 <= args.e25_dynamic_edge_scale <= 2.5:
+        raise SystemExit('--e25-dynamic-edge-scale 必须在 1.0 到 2.5 之间')
     if (args.a4_target or args.e25_target) and args.detector != 'rect':
         raise SystemExit('A4/E25模型模式目前只支持 --detector rect')
     if not 0.0 < args.display_scale <= 1.0:
@@ -1669,10 +1684,12 @@ def main():
                     min_apparent_aspect=float(args.a4_min_apparent_aspect),
                     acquire_confidence=float(args.a4_acquire_confidence),
                     track_identity_confidence=float(args.a4_track_confidence),
-                    occlusion_hold_frames=int(args.a4_occlusion_frames),
+                    recovery_hold_frames=int(args.e25_recovery_frames),
+                    max_prediction_frames=int(args.e25_max_prediction_frames),
                     static_global_interval=int(args.a4_global_interval),
                     search_interval=int(args.a4_search_interval),
                     structural_validate_interval=int(args.a4_local_validate_interval),
+                    dynamic_edge_search_scale=float(args.e25_dynamic_edge_scale),
                 ),
                 require_red_rings=a4_settings.get_require_red_rings(),
             )

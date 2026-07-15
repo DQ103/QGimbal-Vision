@@ -16,7 +16,9 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --a4-min-apparent-aspect "${E25_MIN_APPARENT_ASPECT:-1.20}" \
   --a4-acquire-confidence "${E25_ACQUIRE_CONFIDENCE:-0.68}" \
   --a4-track-confidence "${E25_TRACK_CONFIDENCE:-0.48}" \
-  --a4-occlusion-frames "${E25_OCCLUSION_FRAMES:-12}" \
+  --e25-recovery-frames "${E25_RECOVERY_FRAMES:-24}" \
+  --e25-max-prediction-frames "${E25_MAX_PREDICTION_FRAMES:-4}" \
+  --e25-dynamic-edge-scale "${E25_DYNAMIC_EDGE_SCALE:-2.0}" \
   --a4-require-red-rings "${E25_REQUIRE_RED_RINGS:-0}" \
   --stream-scale "${E25_STREAM_SCALE:-0.75}" \
   --stream-every "${E25_STREAM_EVERY:-2}" \

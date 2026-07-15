@@ -64,6 +64,7 @@ class E25EdgeTracker:
         frame: np.ndarray,
         predicted_quad: np.ndarray,
         canonical_size: Tuple[int, int],
+        search_scale: float = 1.0,
     ) -> EdgeMeasurement:
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -103,6 +104,7 @@ class E25EdgeTracker:
                 side_vector,
                 normal,
                 tape_depth,
+                search_scale,
             )
             side_measurement = self._fit_side(side_index, samples, side_length)
             sides.append(side_measurement)
@@ -140,11 +142,14 @@ class E25EdgeTracker:
         side_vector: np.ndarray,
         inward_normal: np.ndarray,
         tape_depth: float,
+        search_scale: float,
     ) -> List[EdgeSample]:
+        search_scale = max(1.0, min(2.5, float(search_scale)))
         fractions = np.linspace(0.08, 0.92, self.config.samples_per_side, dtype=np.float32)
         predicted_outer = start.reshape(1, 2) + fractions.reshape(-1, 1) * side_vector.reshape(1, 2)
-        outside = max(6.0, 0.70 * tape_depth)
-        inside = max(14.0, 2.10 * tape_depth)
+        expansion = search_scale - 1.0
+        outside = max(6.0, (0.70 + 0.90 * expansion) * tape_depth)
+        inside = max(14.0, (2.10 + 0.90 * expansion) * tape_depth)
         offsets = np.arange(
             -outside,
             inside + self.config.profile_step_px,
@@ -180,6 +185,7 @@ class E25EdgeTracker:
                     outer,
                     inward_normal,
                     tape_depth,
+                    search_scale,
                 )
             if measured is None:
                 samples.append(
@@ -211,6 +217,7 @@ class E25EdgeTracker:
         predicted_outer: np.ndarray,
         inward_normal: np.ndarray,
         tape_depth: float,
+        search_scale: float,
     ) -> Optional[Tuple[np.ndarray, float, float]]:
         profile = np.convolve(
             profile,
@@ -222,9 +229,10 @@ class E25EdgeTracker:
             return None
         contrast = profile[separation:] - profile[:-separation]
         transition_offsets = 0.5 * (offsets[separation:] + offsets[:-separation])
+        expansion = search_scale - 1.0
         valid = (
-            (transition_offsets >= 0.35 * tape_depth)
-            & (transition_offsets <= 1.75 * tape_depth)
+            (transition_offsets >= (0.35 - 0.85 * expansion) * tape_depth)
+            & (transition_offsets <= (1.75 + 0.85 * expansion) * tape_depth)
         )
         if not np.any(valid):
             return None
