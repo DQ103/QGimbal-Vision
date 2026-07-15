@@ -75,6 +75,7 @@ DEFAULT_DETECT_SCALE = 0.25
 DEFAULT_DETECT_MULTI_PASS = 1
 DEFAULT_RECT_CENTER_WEIGHT = 0.25
 DEFAULT_RECT_PREV_WEIGHT = 0.70
+DEFAULT_RECT_MIN_AREA_RATIO = 0.005
 DEFAULT_RECT_MAX_ASPECT = 5.0
 DEFAULT_RECT_MAX_AREA_RATIO = 0.5
 DEFAULT_COMPETITION_MODE = 0
@@ -248,6 +249,8 @@ def parse_args():
                    help=f'目标评分中心权重（默认 {DEFAULT_RECT_CENTER_WEIGHT}）')
     p.add_argument('--rect-prev-weight', type=float, default=DEFAULT_RECT_PREV_WEIGHT,
                    help=f'目标评分历史连续性权重（默认 {DEFAULT_RECT_PREV_WEIGHT}）')
+    p.add_argument('--rect-min-area-ratio', type=float, default=DEFAULT_RECT_MIN_AREA_RATIO,
+                   help=f'候选矩形最小面积占比（默认 {DEFAULT_RECT_MIN_AREA_RATIO}）')
     p.add_argument('--rect-max-aspect', type=float, default=DEFAULT_RECT_MAX_ASPECT,
                    help=f'候选矩形最大长宽比（默认 {DEFAULT_RECT_MAX_ASPECT}）')
     p.add_argument('--rect-max-area-ratio', type=float, default=DEFAULT_RECT_MAX_AREA_RATIO,
@@ -1425,19 +1428,20 @@ def detect_with_scale(
     frame,
     detect_scale: float,
     multi_pass: bool,
+    min_area_ratio: float,
     max_area_ratio: float,
 ):
     detect_func = detect_rectangles_multi_pass if multi_pass else detect_rectangles
     if detect_scale == 1.0:
         if multi_pass:
-            return detect_func(frame, min_area_ratio=0.005, max_area_ratio=max_area_ratio)
-        return detect_func(frame, min_area_ratio=0.005, max_area_ratio=max_area_ratio, angle_tol=25.0)
+            return detect_func(frame, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
+        return detect_func(frame, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio, angle_tol=25.0)
 
     small = cv2.resize(frame, (0, 0), fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
     if multi_pass:
-        rects = detect_func(small, min_area_ratio=0.005, max_area_ratio=max_area_ratio)
+        rects = detect_func(small, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
     else:
-        rects = detect_func(small, min_area_ratio=0.005, max_area_ratio=max_area_ratio, angle_tol=25.0)
+        rects = detect_func(small, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio, angle_tol=25.0)
     inv = 1.0 / detect_scale
     return [
         DetectedRect(
@@ -1479,6 +1483,7 @@ def detect_candidates(
         detect_frame,
         float(args.detect_scale),
         bool(args.detect_multi_pass),
+        float(args.rect_min_area_ratio),
         float(args.rect_max_area_ratio),
     )
 
@@ -1534,8 +1539,8 @@ def main():
         raise SystemExit('--rect-prev-weight 必须大于等于 0')
     if args.rect_max_aspect < 1.0:
         raise SystemExit('--rect-max-aspect 必须大于等于 1')
-    if not 0.0 < args.rect_max_area_ratio <= 1.0:
-        raise SystemExit('--rect-max-area-ratio 必须在 0 到 1 之间')
+    if not 0.0 < args.rect_min_area_ratio < args.rect_max_area_ratio <= 1.0:
+        raise SystemExit('矩形面积占比必须满足 0 < min < max <= 1')
     if args.target_miss_frames < 1:
         raise SystemExit('--target-miss-frames 必须大于等于 1')
     if args.aim_enter_radius_ratio <= 0.0:
@@ -1619,6 +1624,7 @@ def main():
             labels=labels,
         )
     selection_config = RectSelectionConfig(
+        min_area_ratio=float(args.rect_min_area_ratio),
         max_area_ratio=float(args.rect_max_area_ratio),
         max_aspect_ratio=float(args.rect_max_aspect),
         center_weight=float(args.rect_center_weight),
