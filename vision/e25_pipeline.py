@@ -43,6 +43,14 @@ class E25TrackResult:
 
 
 @dataclass(frozen=True)
+class E25GlobalDetectionContext:
+    use_search_detector: bool
+    previous: Optional[A4Detection]
+    candidate_config: A4TargetConfig
+    require_red_rings: bool
+
+
+@dataclass(frozen=True)
 class E25PipelineConfig:
     min_area_ratio: float = 0.0025
     max_area_ratio: float = 0.70
@@ -66,6 +74,8 @@ class E25PipelineConfig:
     far_target_short_side_px: float = 90.0
     far_acquire_confirm_frames: int = 2
     far_acquire_confidence: float = 0.78
+    max_static_identity_age: int = 18
+    max_dynamic_identity_age: int = 4
 
 
 class E25VisionPipeline:
@@ -104,6 +114,7 @@ class E25VisionPipeline:
         self.coarse_quad: Optional[np.ndarray] = None
         self.prediction_age = 0
         self.identity_confidence = 0.0
+        self.identity_age = 0
         self.measurement_quality = 0.0
         self.tracking_confidence = 0.0
         self.pending: Optional[A4Detection] = None
@@ -120,6 +131,7 @@ class E25VisionPipeline:
         self.coarse_quad = None
         self.prediction_age = 0
         self.identity_confidence = 0.0
+        self.identity_age = 0
         self.measurement_quality = 0.0
         self.tracking_confidence = 0.0
         self.pending = None
@@ -141,7 +153,7 @@ class E25VisionPipeline:
         if self.current is None or self.state in (A4TrackState.SEARCH, A4TrackState.LOST):
             return (frame_index - 1) % self.config.search_interval == 0
         if self.state == A4TrackState.OCCLUDED:
-            return True
+            return frame_index % self.config.dynamic_global_interval == 0
         interval = (
             self.config.dynamic_global_interval
             if self.motion.mode == MotionMode.DYNAMIC
@@ -156,56 +168,87 @@ class E25VisionPipeline:
             return self.search_detector.config
         return self.detector.config
 
+    def global_detection_context(self) -> E25GlobalDetectionContext:
+        use_search_detector = (
+            self.current is None
+            or self.state in (A4TrackState.SEARCH, A4TrackState.LOST, A4TrackState.OCCLUDED)
+        )
+        return E25GlobalDetectionContext(
+            use_search_detector=use_search_detector,
+            previous=self.reliable or self.current,
+            candidate_config=self.candidate_config(),
+            require_red_rings=self.require_red_rings,
+        )
+
+    def detect_global(
+        self,
+        frame: np.ndarray,
+        candidates: Sequence[DetectedRect],
+        context: E25GlobalDetectionContext,
+    ) -> Tuple[A4Detection, ...]:
+        active_detector = (
+            self.search_detector
+            if context.use_search_detector
+            else self.detector
+        )
+        active_candidates = (
+            _rank_long_range_candidates(
+                frame,
+                candidates,
+                context.previous,
+                active_detector.config.max_candidates,
+            )
+            if context.use_search_detector
+            else candidates
+        )
+        return tuple(
+            self._rescore_detection(
+                detection,
+                require_red_rings=context.require_red_rings,
+            )
+            for detection in active_detector.detect(
+                frame,
+                active_candidates,
+                context.previous,
+                compute_red_rings=context.require_red_rings,
+            )
+        )
+
     def update(
         self,
         frame: np.ndarray,
         candidates: Sequence[DetectedRect],
         detection_cycle: bool = True,
         dt: float = 1.0 / 30.0,
+        gray_frame: Optional[np.ndarray] = None,
+        global_detections: Optional[Sequence[A4Detection]] = None,
+        defer_structural_validation: bool = False,
     ) -> E25TrackResult:
         self.frame_count += 1
-        global_detections = []
-        if detection_cycle:
-            active_detector = (
-                self.search_detector
-                if self.current is None or self.state == A4TrackState.OCCLUDED
-                else self.detector
+        if self.current is not None:
+            self.identity_age += 1
+        detections: Sequence[A4Detection] = global_detections or ()
+        if detection_cycle and global_detections is None:
+            detections = self.detect_global(
+                frame,
+                candidates,
+                self.global_detection_context(),
             )
-            active_candidates = (
-                _rank_long_range_candidates(
-                    frame,
-                    candidates,
-                    self.reliable or self.current,
-                    active_detector.config.max_candidates,
-                )
-                if active_detector is self.search_detector
-                else candidates
-            )
-            global_detections = [
-                self._rescore_detection(detection)
-                for detection in active_detector.detect(
-                    frame,
-                    active_candidates,
-                    self.reliable or self.current,
-                )
-            ]
+
+        tracking_frame = gray_frame
+        if tracking_frame is None:
+            tracking_frame = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if self.current is None:
             search_candidate = next(
-                (detection for detection in global_detections if self._acquisition_ok(detection)),
-                global_detections[0] if global_detections else None,
+                (detection for detection in detections if self._acquisition_ok(detection)),
+                detections[0] if detections else None,
             )
             return self._update_search(
-                frame,
+                tracking_frame,
                 search_candidate,
                 detection_cycle,
             )
-
-        tracking_frame = (
-            frame
-            if frame.ndim == 2
-            else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        )
         base = self.reliable or self.current
         if self.coarse_quad is None:
             self.coarse_quad = base.quad.copy()
@@ -241,7 +284,7 @@ class E25VisionPipeline:
             )
 
         associated = self._associated_detection(
-            global_detections,
+            detections,
             predicted_quad,
             recovering=dynamic_tracking,
         )
@@ -253,20 +296,18 @@ class E25VisionPipeline:
                 (1.0 - alpha) * order_quad_points(predicted_quad)
                 + alpha * order_quad_points(associated.quad)
             ).astype(np.float32)
-            evaluated = self.detector.evaluate(
-                frame,
-                DetectedRect(
-                    center=quad_center(blended_quad),
-                    box=blended_quad,
-                    area=float(abs(cv2.contourArea(blended_quad))),
-                    pass_index=-3,
-                ),
-                self.reliable or self.current,
+            base = _reproject_detection(
+                associated,
+                blended_quad,
+                (),
+                associated.scores.visible_sides,
             )
-            if evaluated is not None:
-                base = self._rescore_detection(evaluated)
-                predicted_quad = base.quad
-                self.identity_confidence = max(self.identity_confidence * 0.75, base.confidence)
+            predicted_quad = base.quad
+            self.identity_confidence = max(
+                self.identity_confidence * 0.75,
+                associated.confidence,
+            )
+            self.identity_age = 0
 
         edge_measurement = self.edge_tracker.measure(
             tracking_frame,
@@ -307,11 +348,12 @@ class E25VisionPipeline:
                 )
                 or self.frame_count % self.config.structural_validate_interval == 0
             )
-            if validate_now:
+            if validate_now and not defer_structural_validation:
                 validated = self.detector.evaluate(
                     frame,
                     measured.rect,
                     self.reliable or self.current,
+                    compute_red_rings=self.require_red_rings,
                 )
                 if validated is not None:
                     validated = self._rescore_detection(validated)
@@ -328,6 +370,7 @@ class E25VisionPipeline:
                             edge_measurement.visible_sides,
                         )
                         self.identity_confidence = 0.70 * self.identity_confidence + 0.30 * validated.confidence
+                        self.identity_age = 0
                     else:
                         self.identity_confidence *= 0.94
                 else:
@@ -356,6 +399,12 @@ class E25VisionPipeline:
                 and self.measurement_quality >= 0.45
                 and self.tracking_confidence >= 0.52
                 and edge_measurement.visible_sides >= 3
+                and self.identity_age
+                <= (
+                    self.config.max_dynamic_identity_age
+                    if dynamic_tracking
+                    else self.config.max_static_identity_age
+                )
             )
             measured = _with_combined_confidence(
                 measured,
@@ -382,6 +431,7 @@ class E25VisionPipeline:
                 self.identity_confidence * 0.80,
                 associated.confidence,
             )
+            self.identity_age = 0
             self.measurement_quality = associated.scores.edge
             self.tracking_confidence = max(
                 0.58,
@@ -494,6 +544,7 @@ class E25VisionPipeline:
         self.reliable = best
         self.coarse_quad = best.quad.copy()
         self.identity_confidence = best.confidence
+        self.identity_age = 0
         self.measurement_quality = best.scores.edge
         self.tracking_confidence = 0.75
         self.motion.reset(best.center)
@@ -507,8 +558,14 @@ class E25VisionPipeline:
         self.search_preview = None
         return self._result(best, True, False, None, False)
 
-    def _rescore_detection(self, detection: A4Detection) -> A4Detection:
-        if self.require_red_rings:
+    def _rescore_detection(
+        self,
+        detection: A4Detection,
+        require_red_rings: Optional[bool] = None,
+    ) -> A4Detection:
+        if require_red_rings is None:
+            require_red_rings = self.require_red_rings
+        if require_red_rings:
             return detection
         paper = _paper_surface_score(detection.canonical)
         structural = (

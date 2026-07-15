@@ -10,7 +10,7 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --detect-multi-pass 0 \
   --detect-scale "${E25_DETECT_SCALE:-0.75}" \
   --rect-max-area-ratio "${E25_MAX_AREA_RATIO:-0.70}" \
-  --a4-global-interval "${E25_GLOBAL_INTERVAL:-15}" \
+  --a4-global-interval "${E25_GLOBAL_INTERVAL:-6}" \
   --a4-search-interval "${E25_SEARCH_INTERVAL:-6}" \
   --a4-local-validate-interval "${E25_VALIDATE_INTERVAL:-5}" \
   --a4-min-area-ratio "${E25_MIN_AREA_RATIO:-0.0025}" \
@@ -20,6 +20,10 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --e25-recovery-frames "${E25_RECOVERY_FRAMES:-24}" \
   --e25-max-prediction-frames "${E25_MAX_PREDICTION_FRAMES:-4}" \
   --e25-dynamic-edge-scale "${E25_DYNAMIC_EDGE_SCALE:-2.0}" \
+  --e25-async-global "${E25_ASYNC_GLOBAL:-1}" \
+  --e25-global-max-age "${E25_GLOBAL_MAX_AGE:-6}" \
+  --e25-global-min-interval "${E25_GLOBAL_MIN_INTERVAL:-0.10}" \
+  --opencv-threads "${E25_OPENCV_THREADS:-4}" \
   --a4-require-red-rings "${E25_REQUIRE_RED_RINGS:-0}" \
   --stream-scale "${E25_STREAM_SCALE:-0.75}" \
   --stream-every "${E25_STREAM_EVERY:-2}" \

@@ -14,6 +14,7 @@ GUI 模式按 'q' 或 ESC 退出；无窗口模式请按 Ctrl+C 退出。
 """
 
 import argparse
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import cv2
@@ -30,6 +31,7 @@ import numpy as np
 
 from vision.a4_target import (
     a4_center_mm,
+    A4Detection,
     A4TargetConfig,
     A4TargetTracker,
     detection_as_rect,
@@ -48,7 +50,11 @@ from vision.competition_vision import (
     stage_error,
 )
 from vision.e25_laser import E25LaserTracker
-from vision.e25_pipeline import E25PipelineConfig, E25VisionPipeline
+from vision.e25_pipeline import (
+    E25GlobalDetectionContext,
+    E25PipelineConfig,
+    E25VisionPipeline,
+)
 from vision.rect_detect import (
     DetectedRect,
     RectSelectionConfig,
@@ -102,6 +108,9 @@ DEFAULT_E25_TARGET = 0
 DEFAULT_E25_RECOVERY_FRAMES = 24
 DEFAULT_E25_MAX_PREDICTION_FRAMES = 4
 DEFAULT_E25_DYNAMIC_EDGE_SCALE = 2.0
+DEFAULT_E25_ASYNC_GLOBAL = 1
+DEFAULT_E25_GLOBAL_MAX_AGE = 6
+DEFAULT_E25_GLOBAL_MIN_INTERVAL = 0.10
 DEFAULT_DETECTOR = "rect"
 DEFAULT_YOLO_SCALE = 0.33
 DEFAULT_YOLO_EVERY = 1
@@ -119,6 +128,7 @@ DEFAULT_STREAM_PORT = 0
 DEFAULT_STREAM_SCALE = 0.5
 DEFAULT_STREAM_EVERY = 2
 DEFAULT_STREAM_QUALITY = 70
+DEFAULT_OPENCV_THREADS = 0
 COLOR_DEFAULTS = {
     "brightness": 0.0,
     "contrast": 1.0,
@@ -237,6 +247,8 @@ def parse_args():
                    help=f'采集帧率（默认 {DEFAULT_FPS}）')
     p.add_argument('--max-processing-fps', type=float, default=0.0,
                    help='限制检测和推流循环帧率；0 表示不限制')
+    p.add_argument('--opencv-threads', type=int, default=DEFAULT_OPENCV_THREADS,
+                   help='OpenCV/TBB工作线程数；0 表示使用OpenCV默认值')
     p.add_argument('--format', type=str, default=DEFAULT_FORMAT,
                    help=f'GStreamer v4l2src 输出格式（默认 {DEFAULT_FORMAT}，可试 NV12/RGB）')
     p.add_argument('--capture-mode', choices=['raw', 'bgr'], default=DEFAULT_CAPTURE_MODE,
@@ -307,6 +319,12 @@ def parse_args():
                    help=f'E25丢测量后允许继续外推的最大帧数（默认 {DEFAULT_E25_MAX_PREDICTION_FRAMES}）')
     p.add_argument('--e25-dynamic-edge-scale', type=float, default=DEFAULT_E25_DYNAMIC_EDGE_SCALE,
                    help=f'E25动态状态法线搜索范围倍率（默认 {DEFAULT_E25_DYNAMIC_EDGE_SCALE}）')
+    p.add_argument('--e25-async-global', type=int, choices=[0, 1], default=DEFAULT_E25_ASYNC_GLOBAL,
+                   help='E25全局候选和结构验证是否放到最新帧后台线程（0/1）')
+    p.add_argument('--e25-global-max-age', type=int, default=DEFAULT_E25_GLOBAL_MAX_AGE,
+                   help='异步全局检测结果允许滞后的最大帧数')
+    p.add_argument('--e25-global-min-interval', type=float, default=DEFAULT_E25_GLOBAL_MIN_INTERVAL,
+                   help='异步全局检测任务的最小提交间隔秒数')
     p.add_argument('--detector', choices=['rect', 'yolo', 'hybrid'], default=DEFAULT_DETECTOR,
                    help=f'检测器：rect 传统CV，yolo 外部NPU/YOLO，hybrid YOLO优先传统CV兜底（默认 {DEFAULT_DETECTOR}）')
     p.add_argument('--yolo-command', type=str, default='',
@@ -492,6 +510,56 @@ def open_capture(args, width: int, height: int, output_width: int, output_height
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, args.fps)
     return cap
+
+
+class LatestFrameCapture:
+    def __init__(self, capture) -> None:
+        self.capture = capture
+        self._condition = threading.Condition()
+        self._frame = None
+        self._frame_id = 0
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def read(
+        self,
+        after_frame_id: int,
+        timeout: float = 1.0,
+    ) -> Tuple[bool, Optional[np.ndarray], int]:
+        with self._condition:
+            available = self._condition.wait_for(
+                lambda: self._stopped or self._frame_id != after_frame_id,
+                timeout=timeout,
+            )
+            if not available or self._frame is None:
+                return False, None, after_frame_id
+            return True, self._frame, self._frame_id
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._thread.join(timeout=1.0)
+        self.capture.release()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                if self._stopped:
+                    return
+            ret, frame = self.capture.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+            with self._condition:
+                if self._stopped:
+                    return
+                self._frame = frame
+                self._frame_id += 1
+                self._condition.notify_all()
 
 
 def extract_frame(frame, width: int, height: int, args):
@@ -1259,6 +1327,7 @@ class MjpegStreamer:
         self._frame_id = 0
         self._encode_condition = threading.Condition()
         self._pending_frame = None
+        self._pending_renderer: Optional[Callable[[], np.ndarray]] = None
         self._pending_frame_id = 0
         self._stopped = False
         self._server: Optional[ThreadingHTTPServer] = None
@@ -1413,6 +1482,14 @@ class MjpegStreamer:
     def update(self, frame) -> None:
         with self._encode_condition:
             self._pending_frame = frame.copy()
+            self._pending_renderer = None
+            self._pending_frame_id += 1
+            self._encode_condition.notify()
+
+    def update_renderer(self, renderer: Callable[[], np.ndarray]) -> None:
+        with self._encode_condition:
+            self._pending_frame = None
+            self._pending_renderer = renderer
             self._pending_frame_id += 1
             self._encode_condition.notify()
 
@@ -1426,8 +1503,15 @@ class MjpegStreamer:
                 if self._stopped:
                     return
                 frame = self._pending_frame
+                renderer = self._pending_renderer
                 last_encoded_id = self._pending_frame_id
 
+            if renderer is not None:
+                try:
+                    frame = renderer()
+                except Exception as exc:
+                    print(f'MJPEG render failed: {exc}')
+                    continue
             if frame is None:
                 continue
 
@@ -1482,6 +1566,107 @@ def detect_with_scale(
         )
         for rect in rects
     ]
+
+
+@dataclass(frozen=True)
+class E25GlobalDetectionResult:
+    frame_index: int
+    detections: Tuple[A4Detection, ...]
+    context: E25GlobalDetectionContext
+    elapsed_ms: float
+
+
+class AsyncE25GlobalDetector:
+    def __init__(
+        self,
+        tracker: E25VisionPipeline,
+        detect_scale: float,
+        multi_pass: bool,
+        max_area_ratio: float,
+        min_area_ratio: float,
+    ) -> None:
+        self.tracker = tracker
+        self.detect_scale = float(detect_scale)
+        self.multi_pass = bool(multi_pass)
+        self.max_area_ratio = float(max_area_ratio)
+        self.min_area_ratio = float(min_area_ratio)
+        self._condition = threading.Condition()
+        self._pending = None
+        self._result: Optional[E25GlobalDetectionResult] = None
+        self._result_id = -1
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(
+        self,
+        frame: np.ndarray,
+        gray: np.ndarray,
+        frame_index: int,
+    ) -> None:
+        context = self.tracker.global_detection_context()
+        with self._condition:
+            self._pending = (
+                frame.copy(),
+                gray.copy(),
+                int(frame_index),
+                context,
+            )
+            self._condition.notify()
+
+    def latest(self, after_frame_index: int) -> Optional[E25GlobalDetectionResult]:
+        with self._condition:
+            if self._result is None or self._result_id <= after_frame_index:
+                return None
+            return self._result
+
+    def close(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        handled_frame = -1
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._stopped
+                    or (
+                        self._pending is not None
+                        and self._pending[2] != handled_frame
+                    )
+                )
+                if self._stopped:
+                    return
+                frame, gray, frame_index, context = self._pending
+                handled_frame = frame_index
+
+            started = time.perf_counter()
+            base_rects = detect_with_scale(
+                gray,
+                self.detect_scale,
+                self.multi_pass,
+                self.max_area_ratio,
+                self.min_area_ratio,
+            )
+            black_rects = find_black_band_candidates(
+                gray,
+                context.candidate_config,
+            )
+            rects = merge_candidates(base_rects, black_rects, limit=12)
+            detections = self.tracker.detect_global(frame, rects, context)
+            result = E25GlobalDetectionResult(
+                frame_index=frame_index,
+                detections=tuple(detections),
+                context=context,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            with self._condition:
+                if frame_index >= self._result_id:
+                    self._result = result
+                    self._result_id = frame_index
+                    self._condition.notify_all()
 
 
 def detect_candidates(
@@ -1550,6 +1735,8 @@ def main():
         raise SystemExit('--output-size 仅支持 --capture-mode bgr')
     if args.max_processing_fps < 0.0:
         raise SystemExit('--max-processing-fps 必须大于等于 0')
+    if args.opencv_threads < 0:
+        raise SystemExit('--opencv-threads 必须大于等于 0')
     if not 0.0 < args.detect_scale <= 1.0:
         raise SystemExit('--detect-scale 必须在 0 到 1 之间')
     if not 0.0 < args.yolo_scale <= 1.0:
@@ -1608,6 +1795,10 @@ def main():
         raise SystemExit('--e25-max-prediction-frames 必须在 0 到恢复帧数之间')
     if not 1.0 <= args.e25_dynamic_edge_scale <= 2.5:
         raise SystemExit('--e25-dynamic-edge-scale 必须在 1.0 到 2.5 之间')
+    if args.e25_global_max_age < 1:
+        raise SystemExit('--e25-global-max-age 必须大于等于 1')
+    if args.e25_global_min_interval <= 0.0:
+        raise SystemExit('--e25-global-min-interval 必须大于 0')
     if (args.a4_target or args.e25_target) and args.detector != 'rect':
         raise SystemExit('A4/E25模型模式目前只支持 --detector rect')
     if not 0.0 < args.display_scale <= 1.0:
@@ -1623,7 +1814,13 @@ def main():
     if args.stream_port < 0:
         raise SystemExit('--stream-port 必须大于等于 0')
 
+    if args.opencv_threads > 0:
+        cv2.setNumThreads(int(args.opencv_threads))
+        print(f'OpenCV worker threads: {cv2.getNumThreads()}')
+
     cap = open_capture(args, width, height, output_width, output_height)
+    capture_reader = LatestFrameCapture(cap)
+    capture_reader.start()
 
     display = bool(args.display)
     a4_settings = A4RuntimeSettings(
@@ -1676,6 +1873,7 @@ def main():
     target_tracker = None
     a4_tracker = None
     e25_tracker = None
+    e25_global_worker = None
     aim_gate = None
     laser_tracker = None
     if competition_mode:
@@ -1748,6 +1946,16 @@ def main():
                 'robust line fitting, motion prediction and IMX415 laser fusion'
             )
 
+    if e25_mode and bool(args.e25_async_global):
+        e25_global_worker = AsyncE25GlobalDetector(
+            e25_tracker,
+            detect_scale=float(args.detect_scale),
+            multi_pass=bool(args.detect_multi_pass),
+            max_area_ratio=float(args.rect_max_area_ratio),
+            min_area_ratio=float(args.a4_min_area_ratio),
+        )
+        print('E25 async global detection enabled: latest-frame queue, main-loop tracking remains non-blocking')
+
     win_name = f"Camera {args.device if args.backend == 'gstreamer' else args.camera}"
     if display:
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -1759,46 +1967,83 @@ def main():
     fps_window_start = prev_time
     fps_window_frames = 0
     frame_index = 0
+    capture_frame_id = 0
+    last_e25_global_frame = -1
+    last_e25_global_submit = 0.0
     frame_period = 1.0 / args.max_processing_fps if args.max_processing_fps > 0.0 else 0.0
     next_frame_deadline = time.monotonic()
 
     try:
         while True:
-            ret, frame = cap.read()
+            ret, frame, capture_frame_id = capture_reader.read(capture_frame_id)
             if not ret or frame is None:
                 print("无法从摄像头读取到帧，正在重试...")
-                time.sleep(0.1)
                 continue
 
             frame_index += 1
             detect_frame = extract_frame(frame, output_width, output_height, args)
             h, w = detect_frame.shape[:2]
+            e25_gray = None
+            if e25_mode:
+                e25_gray = (
+                    detect_frame
+                    if detect_frame.ndim == 2
+                    else cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+                )
+            async_global_detections = None
             if model_target_mode:
                 model_tracker = e25_tracker if e25_mode else a4_tracker
                 model_tracker.set_require_red_rings(a4_settings.get_require_red_rings())
-                a4_detection_cycle = model_tracker.needs_global_detection(frame_index)
-                if a4_detection_cycle:
-                    base_rects = detect_candidates(
-                        args,
-                        frame,
-                        detect_frame,
-                        output_width,
-                        output_height,
-                        yolo_detector,
-                        frame_index,
-                        min_area_ratio=float(args.a4_min_area_ratio),
-                    )
-                    black_rects = (
-                        find_black_band_candidates(
-                            detect_frame,
-                            model_tracker.candidate_config() if e25_mode else model_tracker.config,
+                if e25_mode and e25_global_worker is not None:
+                    a4_detection_cycle = False
+                    async_result = e25_global_worker.latest(last_e25_global_frame)
+                    if async_result is not None:
+                        last_e25_global_frame = async_result.frame_index
+                        result_age = frame_index - async_result.frame_index
+                        rings_match = (
+                            async_result.context.require_red_rings
+                            == a4_settings.get_require_red_rings()
                         )
-                        if e25_mode or len(base_rects) < 2
-                        else []
-                    )
-                    rects = merge_candidates(base_rects, black_rects, limit=12)
-                else:
+                        if result_age <= int(args.e25_global_max_age) and rings_match:
+                            async_global_detections = async_result.detections
+                            a4_detection_cycle = True
+                    submit_now = time.monotonic()
+                    if (
+                        model_tracker.needs_global_detection(frame_index)
+                        and submit_now - last_e25_global_submit
+                        >= float(args.e25_global_min_interval)
+                    ):
+                        e25_global_worker.submit(
+                            detect_frame,
+                            e25_gray,
+                            frame_index,
+                        )
+                        last_e25_global_submit = submit_now
                     rects = []
+                else:
+                    a4_detection_cycle = model_tracker.needs_global_detection(frame_index)
+                    if a4_detection_cycle:
+                        base_rects = detect_candidates(
+                            args,
+                            frame,
+                            e25_gray if e25_mode else detect_frame,
+                            output_width,
+                            output_height,
+                            yolo_detector,
+                            frame_index,
+                            min_area_ratio=float(args.a4_min_area_ratio),
+                        )
+                        black_rects = (
+                            find_black_band_candidates(
+                                e25_gray if e25_mode else detect_frame,
+                                model_tracker.candidate_config() if e25_mode else model_tracker.config,
+                            )
+                            if e25_mode or len(base_rects) < 2
+                            else []
+                        )
+                        rects = merge_candidates(base_rects, black_rects, limit=12)
+                    else:
+                        rects = []
             else:
                 rects = detect_candidates(
                     args,
@@ -1824,6 +2069,9 @@ def main():
                             rects,
                             detection_cycle=a4_detection_cycle,
                             dt=1.0 / max(float(args.fps), 1.0),
+                            gray_frame=e25_gray,
+                            global_detections=async_global_detections,
+                            defer_structural_validation=(e25_global_worker is not None),
                         )
                     else:
                         a4_result = a4_tracker.update(
@@ -1899,40 +2147,64 @@ def main():
             should_refresh_display = display and frame_index % int(args.display_every) == 0
             should_refresh_stream = streamer is not None and frame_index % int(args.stream_every) == 0
             if should_refresh_stream:
-                stream_frame = make_display_frame(
-                    frame,
-                    detect_frame,
-                    output_width,
-                    output_height,
-                    args,
-                    float(args.stream_scale),
-                )
-                stream_h, stream_w = stream_frame.shape[:2]
-                stream_best = scale_detected_rect(best, stream_w / w, stream_h / h)
-                stream_competition = make_competition_overlay(
-                    target_track,
-                    laser_track,
-                    aim_status,
-                    vision_stage,
-                    vision_error,
-                    w,
-                    h,
-                    float(args.aim_enter_radius_ratio),
-                    stream_w / w,
-                    stream_h / h,
-                    a4_result=a4_result,
-                    a4_require_red_rings=a4_settings.get_require_red_rings(),
-                )
-                draw_overlay(
-                    stream_frame,
-                    stream_best,
-                    ctrl_out,
-                    fps,
-                    stream_w,
-                    stream_h,
-                    competition=stream_competition,
-                )
-                streamer.update(stream_frame)
+                rings_required = a4_settings.get_require_red_rings()
+
+                def render_stream_frame(
+                    source_frame=frame,
+                    source_detect_frame=detect_frame,
+                    source_best=best,
+                    source_target_track=target_track,
+                    source_laser_track=laser_track,
+                    source_aim_status=aim_status,
+                    source_vision_stage=vision_stage,
+                    source_vision_error=vision_error,
+                    source_a4_result=a4_result,
+                    source_ctrl_out=ctrl_out,
+                    source_fps=fps,
+                    source_width=w,
+                    source_height=h,
+                    source_rings_required=rings_required,
+                ):
+                    stream_frame = make_display_frame(
+                        source_frame,
+                        source_detect_frame,
+                        output_width,
+                        output_height,
+                        args,
+                        float(args.stream_scale),
+                    )
+                    stream_h, stream_w = stream_frame.shape[:2]
+                    stream_best = scale_detected_rect(
+                        source_best,
+                        stream_w / source_width,
+                        stream_h / source_height,
+                    )
+                    stream_competition = make_competition_overlay(
+                        source_target_track,
+                        source_laser_track,
+                        source_aim_status,
+                        source_vision_stage,
+                        source_vision_error,
+                        source_width,
+                        source_height,
+                        float(args.aim_enter_radius_ratio),
+                        stream_w / source_width,
+                        stream_h / source_height,
+                        a4_result=source_a4_result,
+                        a4_require_red_rings=source_rings_required,
+                    )
+                    draw_overlay(
+                        stream_frame,
+                        stream_best,
+                        source_ctrl_out,
+                        source_fps,
+                        stream_w,
+                        stream_h,
+                        competition=stream_competition,
+                    )
+                    return stream_frame
+
+                streamer.update_renderer(render_stream_frame)
 
             if should_refresh_display:
                 display_frame = make_display_frame(
@@ -1986,10 +2258,12 @@ def main():
     except KeyboardInterrupt:
         print('\n收到中断，退出...')
     finally:
-        cap.release()
+        capture_reader.stop()
         serial.close()
         if yolo_detector is not None:
             yolo_detector.close()
+        if e25_global_worker is not None:
+            e25_global_worker.close()
         if streamer is not None:
             streamer.stop()
         if display:

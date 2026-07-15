@@ -69,6 +69,24 @@ measurement. The default web preview is 720 x 405 at about 15 Hz so JPEG encodin
 does not reduce the 30 Hz measurement loop. Use `E25_STREAM_SCALE=1.0` and
 `E25_STREAM_EVERY=1` only when full-rate preview matters more than control latency.
 
+The 30 FPS branch separates the camera, control loop, global identity detector,
+and web renderer:
+
+- A capture thread continuously drains GStreamer into a one-frame latest queue.
+- The main loop performs grayscale conversion once, ROI coarse motion, 64-point
+  edge measurement, laser tracking, and control at camera rate.
+- Candidate generation and full A4 structure validation run asynchronously with
+  a one-frame queue and a 100 ms minimum submission interval.
+- Web resize, overlay drawing, color adjustment, and JPEG encoding run in the
+  preview thread.
+- Stale asynchronous identity results may keep the visual prediction alive, but
+  they cannot set `control_valid`.
+
+On the A7A, `E25_OPENCV_THREADS=4` allows the main and global worker paths to share
+the eight CPU cores without making every small OpenCV operation request all cores.
+The value remains an override because the best setting depends on the image build
+and background services.
+
 Useful overrides:
 
 ```bash

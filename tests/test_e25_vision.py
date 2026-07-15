@@ -146,6 +146,39 @@ def test_pipeline_acquires_and_tracks_translation() -> None:
     assert np.linalg.norm(np.asarray(tracked.detection.center) - np.asarray(quad_center(shifted))) < 8.0
 
 
+def test_async_tracking_disables_control_when_identity_result_is_stale() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    frame = project_target(make_target(), quad)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=1,
+            structural_validate_interval=100,
+            max_static_identity_age=2,
+        ),
+        require_red_rings=False,
+    )
+    pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+
+    fresh = pipeline.update(
+        frame,
+        [],
+        detection_cycle=False,
+        defer_structural_validation=True,
+    )
+    pipeline.update(frame, [], detection_cycle=False, defer_structural_validation=True)
+    stale = pipeline.update(
+        frame,
+        [],
+        detection_cycle=False,
+        defer_structural_validation=True,
+    )
+
+    assert fresh.confidence.control_valid
+    assert stale.current and not stale.confidence.control_valid
+
+
 def test_pipeline_tracks_single_frame_fast_translation() -> None:
     quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
     shifted = quad + np.array([75.0, -30.0], dtype=np.float32)

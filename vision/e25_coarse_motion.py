@@ -45,7 +45,6 @@ class E25CoarseMotionTracker:
         self.config = config
         self.previous_gray: Optional[np.ndarray] = None
         self.previous_quad: Optional[np.ndarray] = None
-        self.previous_scale: Optional[float] = None
 
     def reset(
         self,
@@ -55,50 +54,56 @@ class E25CoarseMotionTracker:
         if frame is None or quad is None:
             self.previous_gray = None
             self.previous_quad = None
-            self.previous_scale = None
             return
-        analysis_scale = self._analysis_scale(quad)
-        gray = _analysis_gray(frame, analysis_scale)
-        scaled_quad = order_quad_points(quad) * analysis_scale
-        self._store_state(gray, scaled_quad, analysis_scale)
+        self._store_state(_as_gray(frame), order_quad_points(quad))
 
     def align_quad(self, quad: np.ndarray) -> None:
-        if self.previous_gray is None or self.previous_scale is None:
+        if self.previous_gray is None:
             return
-        self.previous_quad = (
-            order_quad_points(quad) * self.previous_scale
-        ).astype(np.float32)
+        self.previous_quad = order_quad_points(quad).astype(np.float32)
 
     def estimate(
         self,
         frame: np.ndarray,
         reference_quad: np.ndarray,
     ) -> CoarseMotionEstimate:
+        gray_full = _as_gray(frame)
         reference_full = order_quad_points(reference_quad)
         analysis_scale = self._analysis_scale(reference_full)
-        gray = _analysis_gray(frame, analysis_scale)
-        reference_quad = reference_full * analysis_scale
         min_inliers = (
             self.config.far_min_inliers
             if analysis_scale > self.config.analysis_scale
             else self.config.min_inliers
         )
-        if (
-            self.previous_gray is None
-            or self.previous_quad is None
-            or self.previous_scale is None
-            or abs(self.previous_scale - analysis_scale) > 1e-6
-        ):
-            self._store_state(gray, reference_quad, analysis_scale)
+        if self.previous_gray is None or self.previous_quad is None:
+            self._store_state(gray_full, reference_full)
             return _empty_estimate()
+
+        roi = self._tracking_roi(
+            gray_full.shape[:2],
+            self.previous_quad,
+            reference_full,
+        )
+        if roi is None:
+            self._store_state(gray_full, reference_full)
+            return _empty_estimate()
+        x1, y1, x2, y2 = roi
+        previous_gray = _resize_gray(
+            self.previous_gray[y1:y2, x1:x2],
+            analysis_scale,
+        )
+        gray = _resize_gray(gray_full[y1:y2, x1:x2], analysis_scale)
+        origin = np.array([x1, y1], dtype=np.float32)
+        previous_quad = (self.previous_quad - origin) * analysis_scale
+        reference_quad_local = (reference_full - origin) * analysis_scale
 
         motion_ratio = self._motion_ratio(
             self.previous_gray,
-            gray,
+            gray_full,
             self.previous_quad,
         )
         if motion_ratio < self.config.motion_ratio_threshold:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return CoarseMotionEstimate(
                 quad=reference_full.copy(),
                 inliers=0,
@@ -109,13 +114,13 @@ class E25CoarseMotionTracker:
                 rotation_deg=0.0,
             )
 
-        points = self._feature_points(self.previous_gray, self.previous_quad)
+        points = self._feature_points(previous_gray, previous_quad)
         if points is None or len(points) < min_inliers:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate()
 
         next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            self.previous_gray,
+            previous_gray,
             gray,
             points,
             None,
@@ -124,11 +129,11 @@ class E25CoarseMotionTracker:
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
         )
         if next_points is None or status is None:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate()
         back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
             gray,
-            self.previous_gray,
+            previous_gray,
             next_points,
             None,
             winSize=(25, 25),
@@ -136,7 +141,7 @@ class E25CoarseMotionTracker:
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
         )
         if back_points is None or back_status is None:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate()
 
         valid = (status.reshape(-1) > 0) & (back_status.reshape(-1) > 0)
@@ -148,7 +153,7 @@ class E25CoarseMotionTracker:
         previous = points.reshape(-1, 2)[valid]
         current = next_points.reshape(-1, 2)[valid]
         if len(previous) < min_inliers:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate(tracked_points=len(previous))
 
         transform, inlier_mask = cv2.estimateAffinePartial2D(
@@ -161,20 +166,23 @@ class E25CoarseMotionTracker:
             refineIters=10,
         )
         if transform is None or inlier_mask is None:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate(tracked_points=len(previous))
 
         inliers = int(np.count_nonzero(inlier_mask))
         if inliers < min_inliers:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate(inliers=inliers, tracked_points=len(previous))
 
-        a, b, tx = transform[0]
-        c, d, ty = transform[1]
+        a, _, tx = transform[0]
+        c, _, ty = transform[1]
         scale = math.sqrt(max(0.0, float(a * a + c * c)))
         rotation_deg = math.degrees(math.atan2(float(c), float(a)))
-        transformed_scaled = cv2.transform(reference_quad.reshape(1, -1, 2), transform)[0]
-        transformed = transformed_scaled / analysis_scale
+        transformed_local = cv2.transform(
+            reference_quad_local.reshape(1, -1, 2),
+            transform,
+        )[0]
+        transformed = transformed_local / analysis_scale + origin
         corner_shift = np.linalg.norm(transformed - reference_full, axis=1)
         target_scale = max(math.sqrt(abs(float(cv2.contourArea(reference_full)))), 1.0)
         valid_transform = (
@@ -185,7 +193,7 @@ class E25CoarseMotionTracker:
             and cv2.isContourConvex(transformed.astype(np.float32))
         )
         if not valid_transform:
-            self._store_state(gray, reference_quad, analysis_scale)
+            self._store_state(gray_full, reference_full)
             return _empty_estimate(inliers=inliers, tracked_points=len(previous))
 
         inlier_ratio = inliers / max(float(len(previous)), 1.0)
@@ -196,16 +204,13 @@ class E25CoarseMotionTracker:
         )
         confidence = max(0.0, min(1.0, 0.72 * inlier_ratio + 0.28 * fb_score))
         transformed = order_quad_points(transformed.astype(np.float32))
-        self._store_state(gray, transformed_scaled, analysis_scale)
+        self._store_state(gray_full, transformed)
         return CoarseMotionEstimate(
             quad=transformed,
             inliers=inliers,
             tracked_points=len(previous),
             confidence=confidence,
-            shift=(
-                float(tx) / analysis_scale,
-                float(ty) / analysis_scale,
-            ),
+            shift=(float(tx) / analysis_scale, float(ty) / analysis_scale),
             scale=float(scale),
             rotation_deg=float(rotation_deg),
         )
@@ -239,12 +244,28 @@ class E25CoarseMotionTracker:
     def _store_state(
         self,
         gray: np.ndarray,
-        scaled_quad: np.ndarray,
-        analysis_scale: float,
+        quad: np.ndarray,
     ) -> None:
         self.previous_gray = gray.copy()
-        self.previous_quad = order_quad_points(scaled_quad).copy()
-        self.previous_scale = float(analysis_scale)
+        self.previous_quad = order_quad_points(quad).copy()
+
+    def _tracking_roi(
+        self,
+        frame_shape: Tuple[int, int],
+        previous_quad: np.ndarray,
+        reference_quad: np.ndarray,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        frame_h, frame_w = frame_shape
+        points = np.vstack((previous_quad, reference_quad)).astype(np.float32)
+        x, y, width, height = cv2.boundingRect(points)
+        pad = max(16, int(round(max(width, height) * self.config.roi_pad_ratio)))
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(frame_w, x + width + pad)
+        y2 = min(frame_h, y + height + pad)
+        if x2 - x1 < 16 or y2 - y1 < 16:
+            return None
+        return x1, y1, x2, y2
 
     def _analysis_scale(self, quad: np.ndarray) -> float:
         ordered = order_quad_points(quad)
@@ -291,8 +312,7 @@ def _as_gray(frame: np.ndarray) -> np.ndarray:
     return frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
-def _analysis_gray(frame: np.ndarray, scale: float) -> np.ndarray:
-    gray = _as_gray(frame)
+def _resize_gray(gray: np.ndarray, scale: float) -> np.ndarray:
     if scale == 1.0:
         return gray
     return cv2.resize(

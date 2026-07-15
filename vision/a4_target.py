@@ -230,6 +230,7 @@ class A4TargetDetector:
         frame: np.ndarray,
         candidates: Sequence[DetectedRect],
         previous: Optional[A4Detection] = None,
+        compute_red_rings: bool = True,
     ) -> List[A4Detection]:
         detections: List[A4Detection] = []
         max_candidate_area = max((rect.area for rect in candidates), default=1.0)
@@ -239,7 +240,12 @@ class A4TargetDetector:
             reverse=True,
         )
         for rect in ranked[: self.config.max_candidates]:
-            detection = self.evaluate(frame, rect, previous)
+            detection = self.evaluate(
+                frame,
+                rect,
+                previous,
+                compute_red_rings=compute_red_rings,
+            )
             if detection is not None:
                 detections.append(detection)
         detections.sort(key=lambda item: item.confidence, reverse=True)
@@ -250,6 +256,7 @@ class A4TargetDetector:
         frame: np.ndarray,
         rect: DetectedRect,
         previous: Optional[A4Detection] = None,
+        compute_red_rings: bool = True,
     ) -> Optional[A4Detection]:
         frame_h, frame_w = frame.shape[:2]
         frame_area = float(frame_w * frame_h)
@@ -291,7 +298,14 @@ class A4TargetDetector:
             if not _quad_inside_reasonable_bounds(quad, frame_w, frame_h):
                 continue
             for canonical_size in canonical_sizes:
-                detection = self._evaluate_quad(frame, rect, quad, canonical_size, previous)
+                detection = self._evaluate_quad(
+                    frame,
+                    rect,
+                    quad,
+                    canonical_size,
+                    previous,
+                    compute_red_rings=compute_red_rings,
+                )
                 if detection is not None and (best is None or detection.confidence > best.confidence):
                     best = detection
         return best
@@ -304,6 +318,7 @@ class A4TargetDetector:
         canonical_size: Tuple[int, int],
         previous: Optional[A4Detection],
         allow_refine: bool = True,
+        compute_red_rings: bool = True,
     ) -> Optional[A4Detection]:
         apparent_aspect = _apparent_aspect(quad)
         if not self.config.min_apparent_aspect <= apparent_aspect <= self.config.max_apparent_aspect:
@@ -326,7 +341,11 @@ class A4TargetDetector:
         )
         edge_score, side_scores, band_depths, edge_points = self._edge_support(canonical, inverse)
         black_score = self._black_band_score(canonical, band_depths, side_scores)
-        red_score, ring_scores = self._red_ring_score(canonical)
+        if compute_red_rings:
+            red_score, ring_scores = self._red_ring_score(canonical)
+        else:
+            red_score = 0.0
+            ring_scores = (0.0, 0.0, 0.0, 0.0, 0.0)
         pose_score = _pose_score(quad)
         if pose_score < 0.30:
             return None

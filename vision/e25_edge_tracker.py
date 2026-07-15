@@ -67,7 +67,6 @@ class E25EdgeTracker:
         search_scale: float = 1.0,
     ) -> EdgeMeasurement:
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
         quad = order_quad_points(predicted_quad)
         center = np.asarray(quad_center(quad), dtype=np.float32)
         side_lengths = np.array(
@@ -173,21 +172,71 @@ class E25EdgeTracker:
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         ).astype(np.float32)
+        profiles = cv2.blur(
+            profiles,
+            (5, 1),
+            borderType=cv2.BORDER_REPLICATE,
+        )
+
+        separation = max(2, int(round(0.18 * tape_depth)))
+        if profiles.shape[1] <= separation + 4:
+            return self._empty_samples(
+                side_index,
+                fractions,
+                predicted_outer,
+                tape_depth,
+            )
+        contrast = profiles[:, separation:] - profiles[:, :-separation]
+        transition_offsets = 0.5 * (offsets[separation:] + offsets[:-separation])
+        valid_columns = (
+            (transition_offsets >= (0.35 - 0.85 * expansion) * tape_depth)
+            & (transition_offsets <= (1.75 + 0.85 * expansion) * tape_depth)
+        )
+        if not np.any(valid_columns):
+            return self._empty_samples(
+                side_index,
+                fractions,
+                predicted_outer,
+                tape_depth,
+            )
+        candidate_indices = np.flatnonzero(valid_columns)
+        best_indices = candidate_indices[
+            np.argmax(contrast[:, valid_columns], axis=1)
+        ]
+        rows = np.arange(len(fractions))
+        inner_depths = transition_offsets[best_indices]
+        dark = profiles[rows, best_indices]
+        bright = profiles[
+            rows,
+            np.minimum(best_indices + separation, profiles.shape[1] - 1),
+        ]
+        delta = bright - dark
+        contrast_scores = np.clip((delta - 5.0) / 48.0, 0.0, 1.0)
+        relative_scores = np.clip(
+            (delta / np.maximum(bright, 40.0) - 0.05) / 0.32,
+            0.0,
+            1.0,
+        )
+        darkness_scores = np.clip((delta - 2.0) / 42.0, 0.0, 1.0)
+        depth_scores = np.exp(
+            -np.abs(inner_depths - tape_depth) / max(tape_depth, 2.0)
+        )
+        scores = np.clip(
+            0.55 * np.maximum(contrast_scores, relative_scores)
+            + 0.20 * darkness_scores
+            + 0.25 * depth_scores,
+            0.0,
+            1.0,
+        )
+        measured_outer = predicted_outer + (
+            (inner_depths - tape_depth).reshape(-1, 1)
+            * inward_normal.reshape(1, 2)
+        )
 
         samples: List[EdgeSample] = []
         for index, fraction in enumerate(fractions):
             outer = predicted_outer[index]
-            measured = None
-            if valid_rows[index]:
-                measured = self._measure_profile(
-                    profiles[index],
-                    offsets,
-                    outer,
-                    inward_normal,
-                    tape_depth,
-                    search_scale,
-                )
-            if measured is None:
+            if not valid_rows[index]:
                 samples.append(
                     EdgeSample(
                         side=side_index,
@@ -198,7 +247,9 @@ class E25EdgeTracker:
                     )
                 )
                 continue
-            point, score, inner_depth = measured
+            point = measured_outer[index]
+            score = float(scores[index])
+            inner_depth = float(inner_depths[index])
             samples.append(
                 EdgeSample(
                     side=side_index,
@@ -209,6 +260,24 @@ class E25EdgeTracker:
                 )
             )
         return samples
+
+    @staticmethod
+    def _empty_samples(
+        side_index: int,
+        fractions: np.ndarray,
+        predicted_outer: np.ndarray,
+        tape_depth: float,
+    ) -> List[EdgeSample]:
+        return [
+            EdgeSample(
+                side=side_index,
+                fraction=float(fraction),
+                point=(float(outer[0]), float(outer[1])),
+                score=0.0,
+                inner_depth=tape_depth,
+            )
+            for fraction, outer in zip(fractions, predicted_outer)
+        ]
 
     def _measure_profile(
         self,
