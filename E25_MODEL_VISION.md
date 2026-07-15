@@ -31,7 +31,7 @@ quickly ranks candidates by paper color and A4 aspect before fully verifying the
 best four; stable tracking keeps the cheaper half-resolution candidate path. Far
 cold-start candidates must show all four sides and pass two consecutive checks.
 Targets below 90 pixels
-on the short side use 0.6-scale coarse motion analysis and two-frame acquisition,
+on the short side use 0.45-scale coarse motion analysis and two-frame acquisition,
 while larger targets retain 0.3-scale motion analysis and three-frame acquisition.
 The practical lower bound depends on focus and contrast, but testing covers a
 blurred target with a 45-pixel short side.
