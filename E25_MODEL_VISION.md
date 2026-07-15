@@ -44,8 +44,9 @@ http://100.70.110.24:8081/
 
 The launcher keeps the tested IMX415 path: AWISP BGR output at 960 x 540, 30 Hz,
 single-frame leaky queues, detection at half scale, and full-resolution local edge
-measurement. Web JPEG generation remains outside target measurement and can be
-reduced with `E25_STREAM_EVERY=2` if CPU load affects capture.
+measurement. The default web preview is 720 x 405 at about 15 Hz so JPEG encoding
+does not reduce the 30 Hz measurement loop. Use `E25_STREAM_SCALE=1.0` and
+`E25_STREAM_EVERY=1` only when full-rate preview matters more than control latency.
 
 Useful overrides:
 

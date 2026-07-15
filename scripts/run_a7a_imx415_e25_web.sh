@@ -17,5 +17,6 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --a4-track-confidence "${E25_TRACK_CONFIDENCE:-0.48}" \
   --a4-occlusion-frames "${E25_OCCLUSION_FRAMES:-12}" \
   --a4-require-red-rings "${E25_REQUIRE_RED_RINGS:-0}" \
-  --stream-every "${E25_STREAM_EVERY:-1}" \
+  --stream-scale "${E25_STREAM_SCALE:-0.75}" \
+  --stream-every "${E25_STREAM_EVERY:-2}" \
   "$@"
