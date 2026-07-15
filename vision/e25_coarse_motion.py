@@ -13,7 +13,7 @@ from .a4_target import order_quad_points
 @dataclass(frozen=True)
 class CoarseMotionConfig:
     analysis_scale: float = 0.3
-    far_analysis_scale: float = 0.6
+    far_analysis_scale: float = 0.45
     far_short_side_px: float = 90.0
     max_features: int = 50
     quality_level: float = 0.01
