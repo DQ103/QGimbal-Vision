@@ -8,11 +8,12 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --a4-target 0 \
   --detector rect \
   --detect-multi-pass 0 \
+  --detect-scale "${E25_DETECT_SCALE:-0.75}" \
   --rect-max-area-ratio "${E25_MAX_AREA_RATIO:-0.70}" \
   --a4-global-interval "${E25_GLOBAL_INTERVAL:-15}" \
   --a4-search-interval "${E25_SEARCH_INTERVAL:-6}" \
   --a4-local-validate-interval "${E25_VALIDATE_INTERVAL:-5}" \
-  --a4-min-area-ratio "${E25_MIN_AREA_RATIO:-0.015}" \
+  --a4-min-area-ratio "${E25_MIN_AREA_RATIO:-0.0025}" \
   --a4-min-apparent-aspect "${E25_MIN_APPARENT_ASPECT:-1.20}" \
   --a4-acquire-confidence "${E25_ACQUIRE_CONFIDENCE:-0.68}" \
   --a4-track-confidence "${E25_TRACK_CONFIDENCE:-0.48}" \

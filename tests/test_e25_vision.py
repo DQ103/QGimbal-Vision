@@ -2,7 +2,13 @@ import cv2
 import numpy as np
 
 from control.e25_protocol import E25ControlPacket
-from vision.a4_target import A4TrackState, order_quad_points, quad_center
+from vision.a4_target import (
+    A4TrackState,
+    find_black_band_candidates,
+    merge_candidates,
+    order_quad_points,
+    quad_center,
+)
 from vision.competition_vision import TrackedTarget
 from vision.e25_coarse_motion import E25CoarseMotionTracker
 from vision.e25_edge_tracker import E25EdgeTracker
@@ -25,6 +31,12 @@ def make_target() -> np.ndarray:
 def project_target(target: np.ndarray, quad: np.ndarray, frame_size=(960, 540)) -> np.ndarray:
     width, height = frame_size
     frame = np.full((height, width, 3), 150, dtype=np.uint8)
+    return project_target_onto(frame, target, quad)
+
+
+def project_target_onto(frame: np.ndarray, target: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    height, width = frame.shape[:2]
+    frame = frame.copy()
     source = np.array([[0, 0], [419, 0], [419, 593], [0, 593]], dtype=np.float32)
     transform = cv2.getPerspectiveTransform(source, quad.astype(np.float32))
     warped = cv2.warpPerspective(target, transform, (width, height))
@@ -156,6 +168,100 @@ def test_pipeline_tracks_single_frame_fast_translation() -> None:
     assert np.linalg.norm(
         np.asarray(tracked.detection.center) - np.asarray(quad_center(shifted))
     ) < 10.0
+
+
+def test_long_range_search_acquires_small_blurred_target() -> None:
+    quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
+    frame = project_target(make_target(), quad)
+    frame = cv2.GaussianBlur(frame, (5, 5), 1.1)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            acquire_confirm_frames=1,
+        ),
+        require_red_rings=False,
+    )
+    black_candidates = find_black_band_candidates(frame, pipeline.candidate_config())
+
+    result = pipeline.update(
+        frame,
+        merge_candidates([], black_candidates, limit=12),
+        detection_cycle=True,
+    )
+
+    assert black_candidates
+    assert result.state == A4TrackState.ACQUIRED
+    assert result.detection is not None
+    assert np.linalg.norm(
+        np.asarray(result.detection.center) - np.asarray(quad_center(quad))
+    ) < 8.0
+
+
+def test_long_range_target_uses_two_frame_confirmation() -> None:
+    quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
+    frame = project_target(make_target(), quad)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(acquire_confirm_frames=3),
+        require_red_rings=False,
+    )
+
+    first = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+    second = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+
+    assert first.state == A4TrackState.SEARCH
+    assert second.state == A4TrackState.ACQUIRED
+    assert second.current
+
+
+def test_long_range_search_checks_small_target_behind_larger_distractors() -> None:
+    frame = np.full((540, 960, 3), 150, dtype=np.uint8)
+    target_quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
+    frame = project_target_onto(frame, make_target(), target_quad)
+    orange_target = make_target()
+    orange_target[36:-36, 36:-36] = (34, 61, 132)
+    distractors = (
+        np.array([[40, 30], [180, 30], [180, 128], [40, 128]], dtype=np.float32),
+        np.array([[220, 30], [360, 30], [360, 128], [220, 128]], dtype=np.float32),
+        np.array([[760, 30], [900, 30], [900, 128], [760, 128]], dtype=np.float32),
+        np.array([[40, 380], [180, 380], [180, 478], [40, 478]], dtype=np.float32),
+        np.array([[760, 380], [900, 380], [900, 478], [760, 478]], dtype=np.float32),
+    )
+    for distractor in distractors:
+        frame = project_target_onto(frame, orange_target, distractor)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(acquire_confirm_frames=1),
+        require_red_rings=False,
+    )
+    candidates = [candidate(item) for item in distractors] + [candidate(target_quad)]
+
+    result = pipeline.update(frame, candidates, detection_cycle=True)
+
+    assert result.state == A4TrackState.ACQUIRED
+    assert result.detection is not None
+    assert np.linalg.norm(
+        np.asarray(result.detection.center) - np.asarray(quad_center(target_quad))
+    ) < 8.0
+
+
+def test_long_range_small_target_tracks_after_acquisition() -> None:
+    quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
+    shifted = quad + np.array([8.0, 3.0], dtype=np.float32)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(acquire_confirm_frames=1),
+        require_red_rings=False,
+    )
+    pipeline.update(project_target(make_target(), quad), [candidate(quad)], detection_cycle=True)
+
+    tracked = pipeline.update(
+        project_target(make_target(), shifted),
+        [],
+        detection_cycle=False,
+    )
+
+    assert tracked.state == A4TrackState.TRACKING
+    assert tracked.current and tracked.detection is not None
+    assert np.linalg.norm(
+        np.asarray(tracked.detection.center) - np.asarray(quad_center(shifted))
+    ) < 6.0
 
 
 def test_pipeline_recovers_next_frame_after_extreme_translation() -> None:

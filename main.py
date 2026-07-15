@@ -1458,18 +1458,19 @@ def detect_with_scale(
     detect_scale: float,
     multi_pass: bool,
     max_area_ratio: float,
+    min_area_ratio: float = 0.005,
 ):
     detect_func = detect_rectangles_multi_pass if multi_pass else detect_rectangles
     if detect_scale == 1.0:
         if multi_pass:
-            return detect_func(frame, min_area_ratio=0.005, max_area_ratio=max_area_ratio)
-        return detect_func(frame, min_area_ratio=0.005, max_area_ratio=max_area_ratio, angle_tol=25.0)
+            return detect_func(frame, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
+        return detect_func(frame, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio, angle_tol=25.0)
 
     small = cv2.resize(frame, (0, 0), fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
     if multi_pass:
-        rects = detect_func(small, min_area_ratio=0.005, max_area_ratio=max_area_ratio)
+        rects = detect_func(small, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio)
     else:
-        rects = detect_func(small, min_area_ratio=0.005, max_area_ratio=max_area_ratio, angle_tol=25.0)
+        rects = detect_func(small, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio, angle_tol=25.0)
     inv = 1.0 / detect_scale
     return [
         DetectedRect(
@@ -1491,6 +1492,7 @@ def detect_candidates(
     height: int,
     yolo_detector: Optional[AsyncYoloDetector],
     frame_index: int,
+    min_area_ratio: float = 0.005,
 ):
     detector = args.detector
     if detector in ('yolo', 'hybrid') and yolo_detector is not None:
@@ -1512,6 +1514,7 @@ def detect_candidates(
         float(args.detect_scale),
         bool(args.detect_multi_pass),
         float(args.rect_max_area_ratio),
+        float(min_area_ratio),
     )
 
 
@@ -1783,11 +1786,12 @@ def main():
                         output_height,
                         yolo_detector,
                         frame_index,
+                        min_area_ratio=float(args.a4_min_area_ratio),
                     )
                     black_rects = (
                         find_black_band_candidates(
                             detect_frame,
-                            model_tracker.detector.config if e25_mode else model_tracker.config,
+                            model_tracker.candidate_config() if e25_mode else model_tracker.config,
                         )
                         if e25_mode or len(base_rects) < 2
                         else []

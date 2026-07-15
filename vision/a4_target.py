@@ -36,6 +36,7 @@ class A4TargetConfig:
     max_flow_points: int = 100
     min_apparent_aspect: float = 1.08
     max_apparent_aspect: float = 2.3
+    black_candidate_analysis_scale: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -143,7 +144,11 @@ def find_black_band_candidates(
     config: A4TargetConfig = A4TargetConfig(),
 ) -> List[DetectedRect]:
     original_h, original_w = frame.shape[:2]
-    analysis_scale = 0.5 if min(original_w, original_h) >= 480 else 1.0
+    analysis_scale = (
+        max(0.25, min(1.0, float(config.black_candidate_analysis_scale)))
+        if min(original_w, original_h) >= 480
+        else 1.0
+    )
     if analysis_scale < 1.0:
         analysis_w = max(2, int(round(original_w * analysis_scale)))
         analysis_h = max(2, int(round(original_h * analysis_scale)))

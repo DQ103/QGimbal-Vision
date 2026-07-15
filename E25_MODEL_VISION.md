@@ -25,6 +25,15 @@ for four frames, then freezes while global recovery runs every frame. A structur
 associated target can return immediately without repeating the three-frame cold-start
 confirmation.
 
+Long-range search lowers the E25-only minimum target area to 0.25 percent of the
+960 x 540 analysis frame. Cold search and yellow recovery use full-resolution
+black-band candidate extraction and verify up to six A4-shaped candidates; stable
+tracking keeps the cheaper half-resolution candidate path. Targets below 90 pixels
+on the short side use 0.6-scale coarse motion analysis and two-frame acquisition,
+while larger targets retain 0.3-scale motion analysis and three-frame acquisition.
+The practical lower bound depends on focus and contrast, but testing covers a
+blurred target with a 45-pixel short side.
+
 The web overlay exposes four independent status values:
 
 - `id`: target identity confidence.
@@ -63,6 +72,7 @@ Useful overrides:
 ```bash
 E25_REQUIRE_RED_RINGS=1 scripts/run_a7a_imx415_e25_web.sh
 E25_ACQUIRE_CONFIDENCE=0.64 scripts/run_a7a_imx415_e25_web.sh
+E25_MIN_AREA_RATIO=0.0018 E25_DETECT_SCALE=1.0 scripts/run_a7a_imx415_e25_web.sh
 STREAM_PORT=8083 CONTROL=1 scripts/run_a7a_imx415_e25_web.sh
 ```
 

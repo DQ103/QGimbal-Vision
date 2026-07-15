@@ -44,7 +44,7 @@ class E25TrackResult:
 
 @dataclass(frozen=True)
 class E25PipelineConfig:
-    min_area_ratio: float = 0.015
+    min_area_ratio: float = 0.0025
     max_area_ratio: float = 0.70
     min_apparent_aspect: float = 1.20
     max_apparent_aspect: float = 2.30
@@ -61,6 +61,10 @@ class E25PipelineConfig:
     min_measurement_quality: float = 0.38
     coarse_min_confidence: float = 0.42
     dynamic_edge_search_scale: float = 2.0
+    search_max_candidates: int = 6
+    search_candidate_analysis_scale: float = 1.0
+    far_target_short_side_px: float = 90.0
+    far_acquire_confirm_frames: int = 2
 
 
 class E25VisionPipeline:
@@ -72,14 +76,21 @@ class E25VisionPipeline:
     ) -> None:
         self.config = config
         self.model = model
-        self.detector = A4TargetDetector(
-            A4TargetConfig(
-                min_area_ratio=config.min_area_ratio,
-                max_area_ratio=config.max_area_ratio,
-                min_apparent_aspect=config.min_apparent_aspect,
-                max_apparent_aspect=config.max_apparent_aspect,
-                acquire_confidence=config.acquire_confidence,
-                track_confidence=config.track_identity_confidence,
+        detector_config = A4TargetConfig(
+            min_area_ratio=config.min_area_ratio,
+            max_area_ratio=config.max_area_ratio,
+            min_apparent_aspect=config.min_apparent_aspect,
+            max_apparent_aspect=config.max_apparent_aspect,
+            acquire_confidence=config.acquire_confidence,
+            track_confidence=config.track_identity_confidence,
+            black_candidate_analysis_scale=0.5,
+        )
+        self.detector = A4TargetDetector(detector_config)
+        self.search_detector = A4TargetDetector(
+            replace(
+                detector_config,
+                max_candidates=max(2, int(config.search_max_candidates)),
+                black_candidate_analysis_scale=config.search_candidate_analysis_scale,
             )
         )
         self.edge_tracker = E25EdgeTracker(E25EdgeConfig(), model)
@@ -137,6 +148,15 @@ class E25VisionPipeline:
         )
         return frame_index % interval == 0
 
+    def candidate_config(self) -> A4TargetConfig:
+        if self.current is None or self.state in (
+            A4TrackState.SEARCH,
+            A4TrackState.OCCLUDED,
+            A4TrackState.LOST,
+        ):
+            return self.search_detector.config
+        return self.detector.config
+
     def update(
         self,
         frame: np.ndarray,
@@ -147,9 +167,14 @@ class E25VisionPipeline:
         self.frame_count += 1
         global_detections = []
         if detection_cycle:
+            active_detector = (
+                self.search_detector
+                if self.current is None or self.state == A4TrackState.OCCLUDED
+                else self.detector
+            )
             global_detections = [
                 self._rescore_detection(detection)
-                for detection in self.detector.detect(
+                for detection in active_detector.detect(
                     frame,
                     candidates,
                     self.reliable or self.current,
@@ -447,7 +472,13 @@ class E25VisionPipeline:
             self.pending = best
             self.pending_count = 1
             self.pending_miss_count = 0
-        if self.pending_count < self.config.acquire_confirm_frames:
+        required_confirm_frames = self.config.acquire_confirm_frames
+        if _quad_short_side(best.quad) < self.config.far_target_short_side_px:
+            required_confirm_frames = min(
+                required_confirm_frames,
+                self.config.far_acquire_confirm_frames,
+            )
+        if self.pending_count < required_confirm_frames:
             return self._result(best, False, False, None, False)
 
         self.current = best
@@ -486,22 +517,28 @@ class E25VisionPipeline:
         )
 
     def _acquisition_ok(self, detection: A4Detection) -> bool:
+        far_target = _quad_short_side(detection.quad) < self.config.far_target_short_side_px
         if detection.confidence < self.config.acquire_confidence:
             return False
         if detection.scores.visible_sides < 3:
             return False
-        if detection.scores.edge < 0.55 or detection.scores.black_band < 0.50:
+        min_edge = 0.48 if far_target else 0.55
+        min_black = 0.43 if far_target else 0.50
+        min_paper = 0.40 if far_target else 0.45
+        if detection.scores.edge < min_edge or detection.scores.black_band < min_black:
             return False
-        if _paper_surface_score(detection.canonical) < 0.45:
+        if _paper_surface_score(detection.canonical) < min_paper:
             return False
         if self.require_red_rings and detection.scores.red_rings < 0.25:
             return False
         samples = max(1, len(detection.edge_points) // 4)
         strong_sides = 0
+        point_threshold = 0.26 if far_target else 0.30
+        coverage_threshold = 0.48 if far_target else 0.55
         for side_index in range(4):
             side = detection.edge_points[side_index * samples : (side_index + 1) * samples]
-            coverage = sum(score >= 0.30 for _, _, score in side) / max(len(side), 1)
-            strong_sides += coverage >= 0.55
+            coverage = sum(score >= point_threshold for _, _, score in side) / max(len(side), 1)
+            strong_sides += coverage >= coverage_threshold
         return strong_sides >= 3
 
     def _associated_detection(
@@ -541,13 +578,17 @@ class E25VisionPipeline:
         return None
 
     def _recovery_ok(self, detection: A4Detection) -> bool:
+        far_target = _quad_short_side(detection.quad) < self.config.far_target_short_side_px
         if detection.confidence < self.config.track_identity_confidence:
             return False
         if detection.scores.visible_sides < 3:
             return False
-        if detection.scores.edge < 0.48 or detection.scores.black_band < 0.44:
+        min_edge = 0.43 if far_target else 0.48
+        min_black = 0.40 if far_target else 0.44
+        min_paper = 0.38 if far_target else 0.42
+        if detection.scores.edge < min_edge or detection.scores.black_band < min_black:
             return False
-        if _paper_surface_score(detection.canonical) < 0.42:
+        if _paper_surface_score(detection.canonical) < min_paper:
             return False
         if self.require_red_rings and detection.scores.red_rings < 0.20:
             return False
@@ -707,6 +748,18 @@ def _detections_match(first: A4Detection, second: A4Detection) -> bool:
     )
     area_ratio = min(first.area, second.area) / max(first.area, second.area, 1.0)
     return center_distance <= max(14.0, 0.10 * scale) and area_ratio >= 0.78
+
+
+def _quad_short_side(quad: np.ndarray) -> float:
+    ordered = order_quad_points(quad)
+    lengths = [
+        float(np.linalg.norm(ordered[(index + 1) % 4] - ordered[index]))
+        for index in range(4)
+    ]
+    return min(
+        0.5 * (lengths[0] + lengths[2]),
+        0.5 * (lengths[1] + lengths[3]),
+    )
 
 
 def _paper_surface_score(canonical: np.ndarray) -> float:
