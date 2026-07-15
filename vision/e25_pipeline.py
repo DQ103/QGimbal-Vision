@@ -83,6 +83,7 @@ class E25VisionPipeline:
         self.tracking_confidence = 0.0
         self.pending: Optional[A4Detection] = None
         self.pending_count = 0
+        self.pending_miss_count = 0
         self.search_preview: Optional[A4Detection] = None
         self.miss_count = 0
         self.frame_count = 0
@@ -95,6 +96,7 @@ class E25VisionPipeline:
         self.tracking_confidence = 0.0
         self.pending = None
         self.pending_count = 0
+        self.pending_miss_count = 0
         self.search_preview = None
         self.miss_count = 0
         self.frame_count = 0
@@ -132,7 +134,10 @@ class E25VisionPipeline:
             ]
 
         if self.current is None:
-            return self._update_search(global_detections[0] if global_detections else None)
+            return self._update_search(
+                global_detections[0] if global_detections else None,
+                detection_cycle,
+            )
 
         predicted_quad = self.motion.predict_quad(self.current.quad, dt)
         base = self.current
@@ -255,19 +260,39 @@ class E25VisionPipeline:
         self.reset()
         return result
 
-    def _update_search(self, best: Optional[A4Detection]) -> E25TrackResult:
+    def _update_search(
+        self,
+        best: Optional[A4Detection],
+        detection_cycle: bool,
+    ) -> E25TrackResult:
+        if not detection_cycle:
+            return self._result(self.search_preview, False, False, None, False)
+
         self.search_preview = best
         if best is None or not self._acquisition_ok(best):
-            self.pending = None
-            self.pending_count = 0
+            self.pending_miss_count += 1
+            if self.pending_miss_count >= 3:
+                self.pending = None
+                self.pending_count = 0
+                self.pending_miss_count = 0
             self.state = A4TrackState.SEARCH
             return self._result(best, False, False, None, False)
 
         if self.pending is not None and _detections_match(self.pending, best):
+            self.pending = best
             self.pending_count += 1
+            self.pending_miss_count = 0
+        elif (
+            self.pending is not None
+            and best.confidence < self.pending.confidence + 0.02
+            and self.pending_miss_count < 2
+        ):
+            self.pending_miss_count += 1
+            return self._result(best, False, False, None, False)
         else:
             self.pending = best
             self.pending_count = 1
+            self.pending_miss_count = 0
         if self.pending_count < self.config.acquire_confirm_frames:
             return self._result(best, False, False, None, False)
 
@@ -280,6 +305,7 @@ class E25VisionPipeline:
         self.miss_count = 0
         self.pending = None
         self.pending_count = 0
+        self.pending_miss_count = 0
         self.search_preview = None
         return self._result(best, True, False, None, False)
 

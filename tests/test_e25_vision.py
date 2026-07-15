@@ -111,6 +111,33 @@ def test_pipeline_acquires_and_tracks_translation() -> None:
     assert np.linalg.norm(np.asarray(tracked.detection.center) - np.asarray(quad_center(shifted))) < 8.0
 
 
+def test_pipeline_preserves_acquisition_across_sparse_detection_cycles() -> None:
+    quad = np.array([[310, 55], [635, 65], [660, 495], [280, 480]], dtype=np.float32)
+    frame = project_target(make_target(), quad)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=3,
+        ),
+        require_red_rings=False,
+    )
+
+    first = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+    for _ in range(5):
+        between = pipeline.update(frame, [], detection_cycle=False)
+    second = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+    for _ in range(5):
+        pipeline.update(frame, [], detection_cycle=False)
+    acquired = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+
+    assert first.state == A4TrackState.SEARCH
+    assert between.state == A4TrackState.SEARCH
+    assert second.state == A4TrackState.SEARCH
+    assert acquired.state == A4TrackState.ACQUIRED
+    assert acquired.current
+
+
 def test_e25_laser_rejects_warm_glare() -> None:
     frame = np.full((240, 400, 3), (194, 171, 209), dtype=np.uint8)
     cv2.circle(frame, (165, 100), 12, (125, 230, 253), thickness=-1)
