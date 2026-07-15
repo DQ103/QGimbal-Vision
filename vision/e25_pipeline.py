@@ -138,8 +138,12 @@ class E25VisionPipeline:
             ]
 
         if self.current is None:
-            return self._update_search(
+            search_candidate = next(
+                (detection for detection in global_detections if self._acquisition_ok(detection)),
                 global_detections[0] if global_detections else None,
+            )
+            return self._update_search(
+                search_candidate,
                 detection_cycle,
             )
 
@@ -316,10 +320,12 @@ class E25VisionPipeline:
     def _rescore_detection(self, detection: A4Detection) -> A4Detection:
         if self.require_red_rings:
             return detection
+        paper = _paper_surface_score(detection.canonical)
         structural = (
-            0.42 * detection.scores.edge
-            + 0.42 * detection.scores.black_band
-            + 0.16 * detection.scores.pose
+            0.34 * detection.scores.edge
+            + 0.34 * detection.scores.black_band
+            + 0.12 * detection.scores.pose
+            + 0.20 * paper
         )
         confidence = 0.88 * structural + 0.12 * detection.scores.temporal
         return replace(
@@ -335,6 +341,8 @@ class E25VisionPipeline:
         if detection.scores.visible_sides < 3:
             return False
         if detection.scores.edge < 0.55 or detection.scores.black_band < 0.50:
+            return False
+        if _paper_surface_score(detection.canonical) < 0.45:
             return False
         if self.require_red_rings and detection.scores.red_rings < 0.25:
             return False
@@ -469,3 +477,22 @@ def _detections_match(first: A4Detection, second: A4Detection) -> bool:
     )
     area_ratio = min(first.area, second.area) / max(first.area, second.area, 1.0)
     return center_distance <= max(14.0, 0.10 * scale) and area_ratio >= 0.78
+
+
+def _paper_surface_score(canonical: np.ndarray) -> float:
+    height, width = canonical.shape[:2]
+    margin_x = max(2, int(round(width * 0.14)))
+    margin_y = max(2, int(round(height * 0.14)))
+    interior = canonical[margin_y : height - margin_y, margin_x : width - margin_x]
+    if interior.size == 0:
+        return 0.0
+    if interior.ndim == 2:
+        median_value = float(np.median(interior))
+        return max(0.0, min(1.0, (median_value - 70.0) / 120.0))
+
+    hsv = cv2.cvtColor(interior, cv2.COLOR_BGR2HSV)
+    median_saturation = float(np.median(hsv[:, :, 1]))
+    median_value = float(np.median(hsv[:, :, 2]))
+    neutral_score = 1.0 - max(0.0, min(1.0, (median_saturation - 45.0) / 80.0))
+    brightness_score = max(0.0, min(1.0, (median_value - 75.0) / 120.0))
+    return max(0.0, min(1.0, 0.72 * neutral_score + 0.28 * brightness_score))

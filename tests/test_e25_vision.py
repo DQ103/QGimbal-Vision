@@ -157,6 +157,26 @@ def test_pipeline_rejects_near_square_black_frame_distractor() -> None:
     assert not result.current
 
 
+def test_pipeline_rejects_saturated_landscape_frame_distractor() -> None:
+    quad = np.array([[300, 110], [660, 120], [650, 380], [310, 370]], dtype=np.float32)
+    orange_target = make_target()
+    orange_target[36:-36, 36:-36] = (34, 61, 132)
+    frame = project_target(orange_target, quad)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(
+            min_area_ratio=0.005,
+            acquire_confidence=0.60,
+            acquire_confirm_frames=1,
+        ),
+        require_red_rings=False,
+    )
+
+    result = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+
+    assert result.state == A4TrackState.SEARCH
+    assert not result.current
+
+
 def test_e25_laser_rejects_warm_glare() -> None:
     frame = np.full((240, 400, 3), (194, 171, 209), dtype=np.uint8)
     cv2.circle(frame, (165, 100), 12, (125, 230, 253), thickness=-1)
