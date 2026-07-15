@@ -141,22 +141,52 @@ class E25EdgeTracker:
         inward_normal: np.ndarray,
         tape_depth: float,
     ) -> List[EdgeSample]:
-        fractions = np.linspace(0.08, 0.92, self.config.samples_per_side)
+        fractions = np.linspace(0.08, 0.92, self.config.samples_per_side, dtype=np.float32)
+        predicted_outer = start.reshape(1, 2) + fractions.reshape(-1, 1) * side_vector.reshape(1, 2)
+        outside = max(6.0, 0.70 * tape_depth)
+        inside = max(14.0, 2.10 * tape_depth)
+        offsets = np.arange(
+            -outside,
+            inside + self.config.profile_step_px,
+            self.config.profile_step_px,
+            dtype=np.float32,
+        )
+        profile_points = (
+            predicted_outer[:, None, :]
+            + offsets.reshape(1, -1, 1) * inward_normal.reshape(1, 1, 2)
+        )
+        valid_rows = (
+            np.all(profile_points[:, :, 0] >= 1.0, axis=1)
+            & np.all(profile_points[:, :, 1] >= 1.0, axis=1)
+            & np.all(profile_points[:, :, 0] < gray.shape[1] - 1.0, axis=1)
+            & np.all(profile_points[:, :, 1] < gray.shape[0] - 1.0, axis=1)
+        )
+        profiles = cv2.remap(
+            gray,
+            profile_points[:, :, 0],
+            profile_points[:, :, 1],
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        ).astype(np.float32)
+
         samples: List[EdgeSample] = []
-        for fraction in fractions:
-            predicted_outer = start + side_vector * float(fraction)
-            measured = self._measure_profile(
-                gray,
-                predicted_outer,
-                inward_normal,
-                tape_depth,
-            )
+        for index, fraction in enumerate(fractions):
+            outer = predicted_outer[index]
+            measured = None
+            if valid_rows[index]:
+                measured = self._measure_profile(
+                    profiles[index],
+                    offsets,
+                    outer,
+                    inward_normal,
+                    tape_depth,
+                )
             if measured is None:
                 samples.append(
                     EdgeSample(
                         side=side_index,
                         fraction=float(fraction),
-                        point=(float(predicted_outer[0]), float(predicted_outer[1])),
+                        point=(float(outer[0]), float(outer[1])),
                         score=0.0,
                         inner_depth=tape_depth,
                     )
@@ -176,35 +206,17 @@ class E25EdgeTracker:
 
     def _measure_profile(
         self,
-        gray: np.ndarray,
+        profile: np.ndarray,
+        offsets: np.ndarray,
         predicted_outer: np.ndarray,
         inward_normal: np.ndarray,
         tape_depth: float,
     ) -> Optional[Tuple[np.ndarray, float, float]]:
-        outside = max(6.0, 0.70 * tape_depth)
-        inside = max(14.0, 2.10 * tape_depth)
-        offsets = np.arange(
-            -outside,
-            inside + self.config.profile_step_px,
-            self.config.profile_step_px,
-            dtype=np.float32,
+        profile = np.convolve(
+            profile,
+            np.ones(5, dtype=np.float32) / 5.0,
+            mode="same",
         )
-        points = predicted_outer.reshape(1, 2) + offsets.reshape(-1, 1) * inward_normal.reshape(1, 2)
-        if (
-            np.any(points[:, 0] < 1.0)
-            or np.any(points[:, 1] < 1.0)
-            or np.any(points[:, 0] >= gray.shape[1] - 1.0)
-            or np.any(points[:, 1] >= gray.shape[0] - 1.0)
-        ):
-            return None
-        profile = cv2.remap(
-            gray,
-            points[:, 0].reshape(1, -1),
-            points[:, 1].reshape(1, -1),
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        ).reshape(-1).astype(np.float32)
-        profile = np.convolve(profile, np.ones(5, dtype=np.float32) / 5.0, mode="same")
         separation = max(2, int(round(0.18 * tape_depth)))
         if len(profile) <= separation + 4:
             return None
