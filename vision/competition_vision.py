@@ -155,6 +155,8 @@ class HybridLaserConfig:
     max_jump_ratio: float = 0.14
     hold_frames: int = 2
     position_alpha: float = 0.75
+    require_violet: bool = False
+    strict_violet: bool = False
 
 
 @dataclass(frozen=True)
@@ -319,7 +321,7 @@ class HybridLaserTracker:
             lab = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2LAB)
             strict = cv2.inRange(lab, (89, 128, 0), (255, 255, 44))
             relaxed = cv2.inRange(lab, (38, 128, 0), (255, 255, 53))
-            violet_mask = cv2.bitwise_or(strict, relaxed)
+            violet_mask = strict if self.config.strict_violet else cv2.bitwise_or(strict, relaxed)
 
         max_luma = int(gray.max())
         if max_luma < self.config.min_dynamic_luma:
@@ -371,7 +373,10 @@ class HybridLaserTracker:
             hx2 = min(rw, x + w + halo_pad)
             hy2 = min(rh, y + h + halo_pad)
             violet_pixels = int(cv2.countNonZero(violet_mask[hy1:hy2, hx1:hx2]))
-            if violet_pixels == 0 and local_max < self.config.fallback_min_luma:
+            if self.config.require_violet:
+                if violet_pixels == 0:
+                    continue
+            elif violet_pixels == 0 and local_max < self.config.fallback_min_luma:
                 continue
 
             if self.last is not None:

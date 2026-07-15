@@ -85,6 +85,8 @@ DEFAULT_AIM_CONFIRM_FRAMES = 3
 DEFAULT_LASER_HOLD_FRAMES = 2
 DEFAULT_LASER_MIN_LUMA = 165
 DEFAULT_LASER_FALLBACK_MIN_LUMA = 210
+DEFAULT_LASER_REQUIRE_VIOLET = 0
+DEFAULT_LASER_STRICT_VIOLET = 0
 DEFAULT_A4_TARGET = 0
 DEFAULT_A4_GLOBAL_INTERVAL = 10
 DEFAULT_A4_SEARCH_INTERVAL = 6
@@ -272,6 +274,10 @@ def parse_args():
                    help=f'动态高亮检测最低灰度（默认 {DEFAULT_LASER_MIN_LUMA}）')
     p.add_argument('--laser-fallback-min-luma', type=int, default=DEFAULT_LASER_FALLBACK_MIN_LUMA,
                    help=f'没有紫色光晕时允许亮点候选的最低灰度（默认 {DEFAULT_LASER_FALLBACK_MIN_LUMA}）')
+    p.add_argument('--laser-require-violet', type=int, choices=[0, 1], default=DEFAULT_LASER_REQUIRE_VIOLET,
+                   help='激光候选是否必须具有蓝紫色 LAB 光晕支持（0/1）')
+    p.add_argument('--laser-strict-violet', type=int, choices=[0, 1], default=DEFAULT_LASER_STRICT_VIOLET,
+                   help='只使用严格蓝紫色 LAB 阈值，不启用放宽阈值（0/1）')
     p.add_argument('--a4-target', type=int, choices=[0, 1], default=DEFAULT_A4_TARGET,
                    help='启用无NPU A4靶纸结构验证和空间时域跟踪（0/1）')
     p.add_argument('--a4-global-interval', type=int, default=DEFAULT_A4_GLOBAL_INTERVAL,
@@ -1663,6 +1669,8 @@ def main():
             HybridLaserConfig(
                 min_dynamic_luma=int(args.laser_min_luma),
                 fallback_min_luma=int(args.laser_fallback_min_luma),
+                require_violet=bool(args.laser_require_violet),
+                strict_violet=bool(args.laser_strict_violet),
                 hold_frames=int(args.laser_hold_frames),
             )
         )

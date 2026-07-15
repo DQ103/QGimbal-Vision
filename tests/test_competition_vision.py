@@ -92,6 +92,19 @@ def test_hybrid_laser_rejects_dim_white_reflection_without_violet_support() -> N
     assert tracker.update(frame, target, enabled=True) is None
 
 
+def test_k230_07_profile_requires_violet_support_even_for_white_core() -> None:
+    frame = np.zeros((240, 400, 3), dtype=np.uint8)
+    cv2.circle(frame, (210, 125), 4, (255, 255, 255), thickness=-1)
+    target = current_target()
+    assert target is not None
+
+    tracker = HybridLaserTracker(
+        HybridLaserConfig(require_violet=True, strict_violet=True)
+    )
+
+    assert tracker.update(frame, target, enabled=True) is None
+
+
 def test_laser_hold_does_not_advance_align_laser_stage() -> None:
     frame = np.zeros((240, 400, 3), dtype=np.uint8)
     cv2.circle(frame, (210, 125), 10, (255, 0, 0), thickness=-1)
