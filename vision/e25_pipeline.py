@@ -65,6 +65,7 @@ class E25PipelineConfig:
     search_candidate_analysis_scale: float = 0.75
     far_target_short_side_px: float = 90.0
     far_acquire_confirm_frames: int = 2
+    far_acquire_confidence: float = 0.78
 
 
 class E25VisionPipeline:
@@ -526,14 +527,19 @@ class E25VisionPipeline:
 
     def _acquisition_ok(self, detection: A4Detection) -> bool:
         far_target = _quad_short_side(detection.quad) < self.config.far_target_short_side_px
-        if detection.confidence < self.config.acquire_confidence:
+        min_confidence = (
+            max(self.config.acquire_confidence, self.config.far_acquire_confidence)
+            if far_target
+            else self.config.acquire_confidence
+        )
+        if detection.confidence < min_confidence:
             return False
         min_visible_sides = 4 if far_target else 3
         if detection.scores.visible_sides < min_visible_sides:
             return False
-        min_edge = 0.48 if far_target else 0.55
-        min_black = 0.43 if far_target else 0.50
-        min_paper = 0.45
+        min_edge = 0.60 if far_target else 0.55
+        min_black = 0.60 if far_target else 0.50
+        min_paper = 0.48 if far_target else 0.45
         if detection.scores.edge < min_edge or detection.scores.black_band < min_black:
             return False
         if _paper_surface_score(detection.canonical) < min_paper:
@@ -542,8 +548,8 @@ class E25VisionPipeline:
             return False
         samples = max(1, len(detection.edge_points) // 4)
         strong_sides = 0
-        point_threshold = 0.26 if far_target else 0.30
-        coverage_threshold = 0.48 if far_target else 0.55
+        point_threshold = 0.30
+        coverage_threshold = 0.62 if far_target else 0.55
         for side_index in range(4):
             side = detection.edge_points[side_index * samples : (side_index + 1) * samples]
             coverage = sum(score >= point_threshold for _, _, score in side) / max(len(side), 1)
