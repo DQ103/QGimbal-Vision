@@ -45,6 +45,8 @@ class E25TrackResult:
 class E25PipelineConfig:
     min_area_ratio: float = 0.015
     max_area_ratio: float = 0.70
+    min_apparent_aspect: float = 1.20
+    max_apparent_aspect: float = 2.30
     acquire_confidence: float = 0.72
     track_identity_confidence: float = 0.48
     acquire_confirm_frames: int = 3
@@ -69,6 +71,8 @@ class E25VisionPipeline:
             A4TargetConfig(
                 min_area_ratio=config.min_area_ratio,
                 max_area_ratio=config.max_area_ratio,
+                min_apparent_aspect=config.min_apparent_aspect,
+                max_apparent_aspect=config.max_apparent_aspect,
                 acquire_confidence=config.acquire_confidence,
                 track_confidence=config.track_identity_confidence,
             )

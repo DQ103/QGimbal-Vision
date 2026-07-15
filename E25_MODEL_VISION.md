@@ -8,6 +8,7 @@ not as an arbitrary rectangle.
 
 1. Global discovery finds candidate quadrilaterals and black tape contours.
 2. The A4 detector verifies edge, black-band, pose, temporal, and optional red-ring evidence.
+   Near-square distractors are rejected by a configurable projected A4 aspect gate.
 3. Sixteen normal profiles per side measure the black tape inner transition and recover the outer edge.
 4. Huber line fitting rejects local outliers and reconstructs the quad when at least three sides remain visible.
 5. An alpha-beta predictor switches between dynamic and static gains and predicts the next target position.

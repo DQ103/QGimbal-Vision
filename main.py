@@ -1666,6 +1666,7 @@ def main():
                 E25PipelineConfig(
                     min_area_ratio=float(args.a4_min_area_ratio),
                     max_area_ratio=float(args.rect_max_area_ratio),
+                    min_apparent_aspect=float(args.a4_min_apparent_aspect),
                     acquire_confidence=float(args.a4_acquire_confidence),
                     track_identity_confidence=float(args.a4_track_confidence),
                     occlusion_hold_frames=int(args.a4_occlusion_frames),

@@ -13,6 +13,7 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --a4-search-interval "${E25_SEARCH_INTERVAL:-6}" \
   --a4-local-validate-interval "${E25_VALIDATE_INTERVAL:-5}" \
   --a4-min-area-ratio "${E25_MIN_AREA_RATIO:-0.015}" \
+  --a4-min-apparent-aspect "${E25_MIN_APPARENT_ASPECT:-1.20}" \
   --a4-acquire-confidence "${E25_ACQUIRE_CONFIDENCE:-0.68}" \
   --a4-track-confidence "${E25_TRACK_CONFIDENCE:-0.48}" \
   --a4-occlusion-frames "${E25_OCCLUSION_FRAMES:-12}" \
