@@ -196,6 +196,29 @@ def test_long_range_search_acquires_small_blurred_target() -> None:
     ) < 8.0
 
 
+def test_long_range_validation_recovers_from_inner_border_candidate() -> None:
+    quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
+    inner = quad.copy()
+    inner[[0, 3], 0] += 6.0
+    inner[[1, 2], 0] -= 6.0
+    inner[[0, 1], 1] += 6.0
+    inner[[2, 3], 1] -= 6.0
+    frame = cv2.GaussianBlur(project_target(make_target(), quad), (5, 5), 1.1)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(acquire_confirm_frames=1),
+        require_red_rings=False,
+    )
+
+    result = pipeline.update(frame, [candidate(inner)], detection_cycle=True)
+
+    assert result.state == A4TrackState.ACQUIRED
+    assert result.detection is not None
+    assert result.detection.confidence >= 0.78
+    assert np.linalg.norm(
+        np.asarray(result.detection.center) - np.asarray(quad_center(quad))
+    ) < 6.0
+
+
 def test_long_range_target_uses_two_frame_confirmation() -> None:
     quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
     frame = project_target(make_target(), quad)

@@ -274,11 +274,17 @@ class A4TargetDetector:
             else (self.config.canonical_short, self.config.canonical_long)
         )
         canonical_sizes = (previous.canonical_size,) if rect.pass_index == -3 and previous is not None else (inferred_size,)
-        scale_variants = (
-            ((1.0, 1.0),)
-            if rect.pass_index == -3
-            else ((1.0, 1.0), (1.16, 1.12))
-        )
+        if rect.pass_index == -3:
+            scale_variants = ((1.0, 1.0),)
+        elif min(horizontal, vertical) < 90.0:
+            scale_variants = (
+                (1.0, 1.0),
+                (1.16, 1.12),
+                (1.32, 1.26),
+                (1.48, 1.40),
+            )
+        else:
+            scale_variants = ((1.0, 1.0), (1.16, 1.12))
         best: Optional[A4Detection] = None
         for scale_x, scale_y in scale_variants:
             quad = _scale_quad(original, scale_x, scale_y)
