@@ -131,27 +131,8 @@ class E25LaserTracker:
             return None
         if roi_frame.ndim == 2:
             gray = roi_frame
-            violet_mask = np.zeros_like(gray)
         else:
             gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-            hsv = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
-            lab = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2LAB)
-            blue, green, red = cv2.split(roi_frame)
-            blue_i16 = blue.astype(np.int16)
-            blue_delta = np.where(
-                (blue_i16 - red.astype(np.int16) >= 30)
-                & (blue_i16 - green.astype(np.int16) >= 30),
-                255,
-                0,
-            ).astype(np.uint8)
-            hsv_mask = cv2.inRange(hsv, (112, 60, 175), (165, 255, 255))
-            lab_mask = cv2.inRange(lab, (80, 150, 0), (255, 255, 112))
-            violet_mask = cv2.bitwise_and(blue_delta, cv2.bitwise_or(hsv_mask, lab_mask))
-            violet_mask = cv2.morphologyEx(
-                violet_mask,
-                cv2.MORPH_OPEN,
-                np.ones((3, 3), dtype=np.uint8),
-            )
 
         max_luma = int(gray.max())
         if max_luma < self.config.min_luma:
@@ -206,7 +187,7 @@ class E25LaserTracker:
             hy1 = max(0, y - halo_pad)
             hx2 = min(rw, x + width + halo_pad)
             hy2 = min(rh, y + height + halo_pad)
-            violet_pixels = int(cv2.countNonZero(violet_mask[hy1:hy2, hx1:hx2]))
+            violet_pixels = _count_violet_pixels(roi_frame[hy1:hy2, hx1:hx2])
             if violet_pixels < min_violet:
                 continue
 
@@ -254,6 +235,30 @@ def _ratio_similarity(first: float, second: float) -> float:
     if first <= 0.0 or second <= 0.0:
         return 0.0
     return min(first, second) / max(first, second)
+
+
+def _count_violet_pixels(patch: np.ndarray) -> int:
+    if patch.size == 0 or patch.ndim == 2:
+        return 0
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)
+    blue, green, red = cv2.split(patch)
+    blue_i16 = blue.astype(np.int16)
+    blue_delta = np.where(
+        (blue_i16 - red.astype(np.int16) >= 30)
+        & (blue_i16 - green.astype(np.int16) >= 30),
+        255,
+        0,
+    ).astype(np.uint8)
+    hsv_mask = cv2.inRange(hsv, (112, 60, 175), (165, 255, 255))
+    lab_mask = cv2.inRange(lab, (80, 150, 0), (255, 255, 112))
+    violet_mask = cv2.bitwise_and(blue_delta, cv2.bitwise_or(hsv_mask, lab_mask))
+    violet_mask = cv2.morphologyEx(
+        violet_mask,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    return int(cv2.countNonZero(violet_mask))
 
 
 def _ideal_size_score(value: float, ideal: float, maximum: float) -> float:
