@@ -268,6 +268,7 @@ class E25VisionPipeline:
             validate_now = (
                 (
                     dynamic_tracking
+                    and associated is None
                     and self.frame_count % self.config.dynamic_validate_interval == 0
                 )
                 or self.frame_count % self.config.structural_validate_interval == 0
