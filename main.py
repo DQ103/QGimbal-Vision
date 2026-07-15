@@ -43,6 +43,7 @@ from vision.competition_vision import (
     HybridLaserTracker,
     TrackedTarget,
     TargetTracker,
+    VisionStage,
     resolve_stage,
     stage_error,
 )
