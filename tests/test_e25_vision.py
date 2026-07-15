@@ -212,6 +212,21 @@ def test_long_range_target_uses_two_frame_confirmation() -> None:
     assert second.current
 
 
+def test_long_range_cold_start_requires_all_four_sides() -> None:
+    quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)
+    frame = project_target(make_target(), quad)
+    cv2.rectangle(frame, (444, 246), (516, 257), (150, 150, 150), thickness=-1)
+    pipeline = E25VisionPipeline(
+        E25PipelineConfig(acquire_confirm_frames=1),
+        require_red_rings=False,
+    )
+
+    result = pipeline.update(frame, [candidate(quad)], detection_cycle=True)
+
+    assert result.state == A4TrackState.SEARCH
+    assert not result.current
+
+
 def test_long_range_search_checks_small_target_behind_larger_distractors() -> None:
     frame = np.full((540, 960, 3), 150, dtype=np.uint8)
     target_quad = np.array([[448, 248], [512, 248], [512, 293], [448, 293]], dtype=np.float32)

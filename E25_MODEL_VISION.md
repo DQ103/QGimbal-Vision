@@ -26,9 +26,11 @@ associated target can return immediately without repeating the three-frame cold-
 confirmation.
 
 Long-range search lowers the E25-only minimum target area to 0.25 percent of the
-960 x 540 analysis frame. Cold search and yellow recovery use full-resolution
-black-band candidate extraction and verify up to six A4-shaped candidates; stable
-tracking keeps the cheaper half-resolution candidate path. Targets below 90 pixels
+960 x 540 analysis frame. Cold search uses 0.75-scale black-band extraction and
+quickly ranks candidates by paper color and A4 aspect before fully verifying the
+best four; stable tracking keeps the cheaper half-resolution candidate path. Far
+cold-start candidates must show all four sides and pass two consecutive checks.
+Targets below 90 pixels
 on the short side use 0.6-scale coarse motion analysis and two-frame acquisition,
 while larger targets retain 0.3-scale motion analysis and three-frame acquisition.
 The practical lower bound depends on focus and contrast, but testing covers a

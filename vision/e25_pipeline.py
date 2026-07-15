@@ -61,8 +61,8 @@ class E25PipelineConfig:
     min_measurement_quality: float = 0.38
     coarse_min_confidence: float = 0.42
     dynamic_edge_search_scale: float = 2.0
-    search_max_candidates: int = 6
-    search_candidate_analysis_scale: float = 1.0
+    search_max_candidates: int = 4
+    search_candidate_analysis_scale: float = 0.75
     far_target_short_side_px: float = 90.0
     far_acquire_confirm_frames: int = 2
 
@@ -149,11 +149,9 @@ class E25VisionPipeline:
         return frame_index % interval == 0
 
     def candidate_config(self) -> A4TargetConfig:
-        if self.current is None or self.state in (
-            A4TrackState.SEARCH,
-            A4TrackState.OCCLUDED,
-            A4TrackState.LOST,
-        ):
+        if self.current is None or self.state in (A4TrackState.SEARCH, A4TrackState.LOST):
+            return self.search_detector.config
+        if self.state == A4TrackState.OCCLUDED and self.miss_count % 2 == 0:
             return self.search_detector.config
         return self.detector.config
 
@@ -172,11 +170,21 @@ class E25VisionPipeline:
                 if self.current is None or self.state == A4TrackState.OCCLUDED
                 else self.detector
             )
+            active_candidates = (
+                _rank_long_range_candidates(
+                    frame,
+                    candidates,
+                    self.reliable or self.current,
+                    active_detector.config.max_candidates,
+                )
+                if active_detector is self.search_detector
+                else candidates
+            )
             global_detections = [
                 self._rescore_detection(detection)
                 for detection in active_detector.detect(
                     frame,
-                    candidates,
+                    active_candidates,
                     self.reliable or self.current,
                 )
             ]
@@ -520,11 +528,12 @@ class E25VisionPipeline:
         far_target = _quad_short_side(detection.quad) < self.config.far_target_short_side_px
         if detection.confidence < self.config.acquire_confidence:
             return False
-        if detection.scores.visible_sides < 3:
+        min_visible_sides = 4 if far_target else 3
+        if detection.scores.visible_sides < min_visible_sides:
             return False
         min_edge = 0.48 if far_target else 0.55
         min_black = 0.43 if far_target else 0.50
-        min_paper = 0.40 if far_target else 0.45
+        min_paper = 0.45
         if detection.scores.edge < min_edge or detection.scores.black_band < min_black:
             return False
         if _paper_surface_score(detection.canonical) < min_paper:
@@ -675,6 +684,85 @@ def _tracking_quality(residual: float, area: float, visible_sides: int) -> float
     residual_score = 1.0 - min(1.0, float(residual) / max(8.0, 0.045 * scale))
     side_score = min(1.0, visible_sides / 4.0)
     return max(0.0, min(1.0, 0.72 * residual_score + 0.28 * side_score))
+
+
+def _rank_long_range_candidates(
+    frame: np.ndarray,
+    candidates: Sequence[DetectedRect],
+    previous: Optional[A4Detection],
+    limit: int,
+) -> Sequence[DetectedRect]:
+    if len(candidates) <= limit:
+        return candidates
+    frame_h, frame_w = frame.shape[:2]
+
+    def priority(rect: DetectedRect) -> float:
+        quad = order_quad_points(rect.box)
+        lengths = [
+            float(np.linalg.norm(quad[(index + 1) % 4] - quad[index]))
+            for index in range(4)
+        ]
+        horizontal = 0.5 * (lengths[0] + lengths[2])
+        vertical = 0.5 * (lengths[1] + lengths[3])
+        aspect = max(horizontal, vertical) / max(min(horizontal, vertical), 1.0)
+        aspect_score = math.exp(
+            -abs(math.log(max(aspect, 1e-3) / math.sqrt(2.0))) / 0.50
+        )
+        paper_score = _quick_paper_score(frame, quad)
+        temporal_score = 0.5
+        if previous is not None:
+            scale = max(math.sqrt(previous.area), 1.0)
+            center = quad_center(quad)
+            distance = math.hypot(
+                center[0] - previous.center[0],
+                center[1] - previous.center[1],
+            )
+            center_score = 1.0 - min(1.0, distance / max(2.5 * scale, 1.0))
+            area = abs(float(cv2.contourArea(quad)))
+            area_score = min(area, previous.area) / max(area, previous.area, 1.0)
+            temporal_score = 0.70 * center_score + 0.30 * area_score
+        pass_bonus = 1.0 if rect.pass_index == 20 else 0.5
+        frame_area_score = min(
+            1.0,
+            math.sqrt(max(rect.area, 0.0) / max(frame_w * frame_h * 0.02, 1.0)),
+        )
+        return (
+            0.44 * paper_score
+            + 0.27 * aspect_score
+            + 0.20 * temporal_score
+            + 0.05 * pass_bonus
+            + 0.04 * frame_area_score
+        )
+
+    return sorted(candidates, key=priority, reverse=True)[: max(1, int(limit))]
+
+
+def _quick_paper_score(frame: np.ndarray, quad: np.ndarray) -> float:
+    center = np.mean(quad, axis=0)
+    inner_quad = center.reshape(1, 2) + 0.58 * (quad - center.reshape(1, 2))
+    x, y, width, height = cv2.boundingRect(inner_quad.astype(np.float32))
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(frame.shape[1], x + width)
+    y2 = min(frame.shape[0], y + height)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return 0.0
+    crop = frame[y1:y2, x1:x2]
+    local_quad = np.rint(inner_quad - np.array([x1, y1], dtype=np.float32)).astype(np.int32)
+    mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, local_quad, 255)
+    pixels = crop[mask > 0]
+    if pixels.size == 0:
+        return 0.0
+    if crop.ndim == 2:
+        median_value = float(np.median(pixels))
+        return max(0.0, min(1.0, (median_value - 70.0) / 120.0))
+    hsv_pixels = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    median_saturation = float(np.median(hsv_pixels[:, 1]))
+    median_value = float(np.median(hsv_pixels[:, 2]))
+    neutral_score = 1.0 - max(0.0, min(1.0, (median_saturation - 45.0) / 80.0))
+    brightness_score = max(0.0, min(1.0, (median_value - 75.0) / 120.0))
+    return max(0.0, min(1.0, 0.72 * neutral_score + 0.28 * brightness_score))
 
 
 def _bounded_motion_prediction(
