@@ -74,7 +74,7 @@ def test_coarse_motion_estimates_large_translation() -> None:
     estimate = tracker.estimate(project_target(target, shifted), quad)
 
     assert estimate.quad is not None
-    assert estimate.inliers >= 6
+    assert estimate.inliers >= 5
     error = np.sqrt(
         np.mean(
             np.sum(

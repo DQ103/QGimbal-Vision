@@ -12,12 +12,12 @@ from .a4_target import order_quad_points
 
 @dataclass(frozen=True)
 class CoarseMotionConfig:
-    analysis_scale: float = 0.4
-    max_features: int = 60
+    analysis_scale: float = 0.3
+    max_features: int = 50
     quality_level: float = 0.01
     min_distance: float = 6.0
     roi_pad_ratio: float = 0.30
-    min_inliers: int = 6
+    min_inliers: int = 5
     max_forward_backward_error: float = 1.8
     max_scale_change: float = 0.28
     max_rotation_deg: float = 24.0

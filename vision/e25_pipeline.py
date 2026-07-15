@@ -57,6 +57,7 @@ class E25PipelineConfig:
     static_global_interval: int = 15
     dynamic_global_interval: int = 2
     structural_validate_interval: int = 5
+    dynamic_validate_interval: int = 2
     min_measurement_quality: float = 0.38
     coarse_min_confidence: float = 0.42
     dynamic_edge_search_scale: float = 2.0
@@ -166,10 +167,15 @@ class E25VisionPipeline:
                 detection_cycle,
             )
 
+        tracking_frame = (
+            frame
+            if frame.ndim == 2
+            else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        )
         base = self.reliable or self.current
         if self.coarse_quad is None:
             self.coarse_quad = base.quad.copy()
-        coarse = self.coarse_motion.estimate(frame, self.coarse_quad)
+        coarse = self.coarse_motion.estimate(tracking_frame, self.coarse_quad)
         coarse_valid = (
             coarse.quad is not None
             and coarse.confidence >= self.config.coarse_min_confidence
@@ -229,7 +235,7 @@ class E25VisionPipeline:
                 self.identity_confidence = max(self.identity_confidence * 0.75, base.confidence)
 
         edge_measurement = self.edge_tracker.measure(
-            frame,
+            tracking_frame,
             predicted_quad,
             base.canonical_size,
             search_scale=(
@@ -260,7 +266,10 @@ class E25VisionPipeline:
         if measurement_valid:
             validation_ok = True
             validate_now = (
-                dynamic_tracking
+                (
+                    dynamic_tracking
+                    and self.frame_count % self.config.dynamic_validate_interval == 0
+                )
                 or self.frame_count % self.config.structural_validate_interval == 0
             )
             if validate_now:
@@ -322,7 +331,7 @@ class E25VisionPipeline:
             self.current = measured
             self.reliable = measured
             self.coarse_quad = measured.quad.copy()
-            self.coarse_motion.reset(frame, measured.quad)
+            self.coarse_motion.reset(tracking_frame, measured.quad)
             self.state = A4TrackState.TRACKING
             self.miss_count = 0
             self.prediction_age = 0
@@ -356,7 +365,7 @@ class E25VisionPipeline:
             self.current = recovered
             self.reliable = recovered
             self.coarse_quad = recovered.quad.copy()
-            self.coarse_motion.reset(frame, recovered.quad)
+            self.coarse_motion.reset(tracking_frame, recovered.quad)
             self.state = A4TrackState.ACQUIRED
             self.miss_count = 0
             self.prediction_age = 0
