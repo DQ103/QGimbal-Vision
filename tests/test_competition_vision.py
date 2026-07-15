@@ -105,6 +105,26 @@ def test_k230_07_profile_requires_violet_support_even_for_white_core() -> None:
     assert tracker.update(frame, target, enabled=True) is None
 
 
+def test_k230_07_hardware_profile_separates_laser_from_warm_glare() -> None:
+    frame = np.full((240, 400, 3), (194, 171, 209), dtype=np.uint8)
+    cv2.circle(frame, (165, 100), 12, (125, 230, 253), thickness=-1)
+    cv2.circle(frame, (165, 100), 3, (255, 255, 255), thickness=-1)
+    cv2.circle(frame, (210, 125), 10, (250, 105, 168), thickness=-1)
+    cv2.circle(frame, (210, 125), 3, (255, 253, 255), thickness=-1)
+    target = current_target()
+    assert target is not None
+
+    tracker = HybridLaserTracker(
+        HybridLaserConfig(require_violet=True, strict_violet=True)
+    )
+    laser = tracker.update(frame, target, enabled=True)
+
+    assert laser is not None and laser.current
+    assert abs(laser.center[0] - 210.0) < 3.0
+    assert abs(laser.center[1] - 125.0) < 3.0
+    assert laser.violet_pixels >= 4
+
+
 def test_laser_hold_does_not_advance_align_laser_stage() -> None:
     frame = np.zeros((240, 400, 3), dtype=np.uint8)
     cv2.circle(frame, (210, 125), 10, (255, 0, 0), thickness=-1)

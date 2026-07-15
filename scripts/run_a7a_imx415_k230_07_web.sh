@@ -18,5 +18,6 @@ exec "$ROOT_DIR/scripts/run_a7a_imx415_competition_web.sh" \
   --laser-fallback-min-luma "${LASER_FALLBACK_MIN_LUMA:-255}" \
   --laser-require-violet 1 \
   --laser-strict-violet 1 \
+  --laser-detect-after-ready-only 0 \
   --stream-every "${STREAM_EVERY:-1}" \
   "$@"

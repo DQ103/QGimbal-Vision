@@ -88,6 +88,7 @@ DEFAULT_LASER_MIN_LUMA = 165
 DEFAULT_LASER_FALLBACK_MIN_LUMA = 210
 DEFAULT_LASER_REQUIRE_VIOLET = 0
 DEFAULT_LASER_STRICT_VIOLET = 0
+DEFAULT_LASER_DETECT_AFTER_READY_ONLY = 1
 DEFAULT_A4_TARGET = 0
 DEFAULT_A4_GLOBAL_INTERVAL = 10
 DEFAULT_A4_SEARCH_INTERVAL = 6
@@ -281,6 +282,9 @@ def parse_args():
                    help='激光候选是否必须具有蓝紫色 LAB 光晕支持（0/1）')
     p.add_argument('--laser-strict-violet', type=int, choices=[0, 1], default=DEFAULT_LASER_STRICT_VIOLET,
                    help='只使用严格蓝紫色 LAB 阈值，不启用放宽阈值（0/1）')
+    p.add_argument('--laser-detect-after-ready-only', type=int, choices=[0, 1],
+                   default=DEFAULT_LASER_DETECT_AFTER_READY_ONLY,
+                   help='是否只在目标完成对中后才运行激光检测（0/1）')
     p.add_argument('--a4-target', type=int, choices=[0, 1], default=DEFAULT_A4_TARGET,
                    help='启用无NPU A4靶纸结构验证和空间时域跟踪（0/1）')
     p.add_argument('--a4-global-interval', type=int, default=DEFAULT_A4_GLOBAL_INTERVAL,
@@ -1771,10 +1775,13 @@ def main():
                     target_track = target_tracker.update(rects, w, h)
                 best = target_track.rect if target_track is not None else None
                 aim_status = aim_gate.update(target_track, w, h)
+                laser_enabled = aim_status.ready
+                if not args.laser_detect_after_ready_only:
+                    laser_enabled = target_track is not None and target_track.current
                 laser_track = laser_tracker.update(
                     detect_frame,
                     target_track,
-                    enabled=aim_status.ready,
+                    enabled=laser_enabled,
                 )
                 vision_stage = resolve_stage(target_track, aim_status, laser_track)
                 vision_error = stage_error(vision_stage, target_track, aim_status, laser_track)

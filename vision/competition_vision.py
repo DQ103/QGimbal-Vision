@@ -157,6 +157,7 @@ class HybridLaserConfig:
     position_alpha: float = 0.75
     require_violet: bool = False
     strict_violet: bool = False
+    min_violet_pixels_at_240p: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -318,9 +319,29 @@ class HybridLaserTracker:
             violet_mask = np.zeros_like(gray)
         else:
             gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
             lab = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2LAB)
-            strict = cv2.inRange(lab, (89, 128, 0), (255, 255, 44))
-            relaxed = cv2.inRange(lab, (38, 128, 0), (255, 255, 53))
+            blue, green, red = cv2.split(roi_frame)
+            blue_i16 = blue.astype(np.int16)
+            blue_delta = np.where(
+                (blue_i16 - red.astype(np.int16) >= 30)
+                & (blue_i16 - green.astype(np.int16) >= 30),
+                255,
+                0,
+            ).astype(np.uint8)
+            hsv_violet = cv2.inRange(hsv, (112, 60, 175), (165, 255, 255))
+            lab_violet = cv2.inRange(lab, (80, 150, 0), (255, 255, 112))
+            strict = cv2.bitwise_and(
+                blue_delta,
+                cv2.bitwise_or(hsv_violet, lab_violet),
+            )
+            strict = cv2.morphologyEx(
+                strict,
+                cv2.MORPH_OPEN,
+                np.ones((3, 3), dtype=np.uint8),
+            )
+            relaxed = cv2.inRange(lab, (38, 140, 0), (255, 255, 122))
+            relaxed = cv2.bitwise_and(relaxed, blue_delta)
             violet_mask = strict if self.config.strict_violet else cv2.bitwise_or(strict, relaxed)
 
         max_luma = int(gray.max())
@@ -337,6 +358,10 @@ class HybridLaserTracker:
         scale = max(0.5, min(frame.shape[:2]) / 240.0)
         ideal_pixels = max(1.0, self.config.ideal_pixels_at_240p * scale * scale)
         max_pixels = max(4.0, self.config.max_pixels_at_240p * scale * scale)
+        min_violet_pixels = max(
+            2,
+            int(round(self.config.min_violet_pixels_at_240p * scale * scale)),
+        )
         max_side = max(4.0, self.config.max_side_at_240p * scale)
         max_jump = self.config.max_jump_ratio * min(frame.shape[:2])
 
@@ -374,7 +399,7 @@ class HybridLaserTracker:
             hy2 = min(rh, y + h + halo_pad)
             violet_pixels = int(cv2.countNonZero(violet_mask[hy1:hy2, hx1:hx2]))
             if self.config.require_violet:
-                if violet_pixels == 0:
+                if violet_pixels < min_violet_pixels:
                     continue
             elif violet_pixels == 0 and local_max < self.config.fallback_min_luma:
                 continue
