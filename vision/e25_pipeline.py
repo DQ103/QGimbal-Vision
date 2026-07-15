@@ -331,7 +331,7 @@ class E25VisionPipeline:
             self.current = measured
             self.reliable = measured
             self.coarse_quad = measured.quad.copy()
-            self.coarse_motion.reset(tracking_frame, measured.quad)
+            self.coarse_motion.align_quad(measured.quad)
             self.state = A4TrackState.TRACKING
             self.miss_count = 0
             self.prediction_age = 0

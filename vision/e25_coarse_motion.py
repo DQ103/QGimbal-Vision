@@ -56,6 +56,13 @@ class E25CoarseMotionTracker:
         scaled_quad = order_quad_points(quad) * self.config.analysis_scale
         self._store_state(gray, scaled_quad)
 
+    def align_quad(self, quad: np.ndarray) -> None:
+        if self.previous_gray is None:
+            return
+        self.previous_quad = (
+            order_quad_points(quad) * self.config.analysis_scale
+        ).astype(np.float32)
+
     def estimate(
         self,
         frame: np.ndarray,
