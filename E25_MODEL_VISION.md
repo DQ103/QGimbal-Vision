@@ -75,8 +75,10 @@ and web renderer:
 - A capture thread continuously drains GStreamer into a one-frame latest queue.
 - The main loop performs grayscale conversion once, ROI coarse motion, 64-point
   edge measurement, laser tracking, and control at camera rate.
-- Candidate generation and full A4 structure validation run asynchronously with
-  a one-frame queue and a 100 ms minimum submission interval.
+- Candidate generation and full A4 structure validation run in a separate Python
+  process. BGR and grayscale frames use shared memory; a one-frame queue carries
+  only frame metadata and target context. This prevents Python candidate scoring
+  from blocking the 30 Hz tracker through the GIL.
 - Web resize, overlay drawing, color adjustment, and JPEG encoding run in the
   preview thread.
 - Stale asynchronous identity results may keep the visual prediction alive, but
@@ -86,6 +88,12 @@ On the A7A, `E25_OPENCV_THREADS=4` allows the main and global worker paths to sh
 the eight CPU cores without making every small OpenCV operation request all cores.
 The value remains an override because the best setting depends on the image build
 and background services.
+
+Measured on the A7A with the IMX415 target locked and the 720 x 405 MJPEG stream
+actively consumed for 60 seconds, the optimized path averaged 29.987 FPS, with a
+29.6 FPS minimum and 30.5 FPS maximum. The hottest reported thermal zone was about
+60.4 C. Global identity jobs completed in roughly 47-98 ms and arrived two to four
+frames behind, within the six-frame association gate.
 
 Useful overrides:
 

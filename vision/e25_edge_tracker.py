@@ -41,6 +41,16 @@ class EdgeMeasurement:
 
 
 @dataclass(frozen=True)
+class _SideGeometry:
+    side: int
+    start: np.ndarray
+    vector: np.ndarray
+    normal: np.ndarray
+    length: float
+    tape_depth: float
+
+
+@dataclass(frozen=True)
 class E25EdgeConfig:
     samples_per_side: int = 16
     min_sample_score: float = 0.28
@@ -74,8 +84,7 @@ class E25EdgeTracker:
             dtype=np.float32,
         )
 
-        sides: List[SideMeasurement] = []
-        all_points: List[Tuple[float, float, float]] = []
+        geometries: List[_SideGeometry] = []
         for side_index in range(4):
             start = quad[side_index]
             end = quad[(side_index + 1) % 4]
@@ -96,16 +105,30 @@ class E25EdgeTracker:
                 float(adjacent_length)
                 * self.model.tape_ratio_for_normal(canonical_size, side_index),
             )
-            samples = self._measure_side_samples(
-                gray,
-                side_index,
-                start,
-                side_vector,
-                normal,
-                tape_depth,
-                search_scale,
+            geometries.append(
+                _SideGeometry(
+                    side=side_index,
+                    start=start,
+                    vector=side_vector,
+                    normal=normal,
+                    length=side_length,
+                    tape_depth=tape_depth,
+                )
             )
-            side_measurement = self._fit_side(side_index, samples, side_length)
+
+        samples_by_side = self._measure_all_side_samples(
+            gray,
+            geometries,
+            search_scale,
+        )
+        sides: List[SideMeasurement] = []
+        all_points: List[Tuple[float, float, float]] = []
+        for geometry, samples in zip(geometries, samples_by_side):
+            side_measurement = self._fit_side(
+                geometry.side,
+                samples,
+                geometry.length,
+            )
             sides.append(side_measurement)
             all_points.extend((sample.point[0], sample.point[1], sample.score) for sample in samples)
 
@@ -133,37 +156,54 @@ class E25EdgeTracker:
             edge_points=tuple(all_points),
         )
 
-    def _measure_side_samples(
+    def _measure_all_side_samples(
         self,
         gray: np.ndarray,
-        side_index: int,
-        start: np.ndarray,
-        side_vector: np.ndarray,
-        inward_normal: np.ndarray,
-        tape_depth: float,
+        geometries: Sequence[_SideGeometry],
         search_scale: float,
-    ) -> List[EdgeSample]:
+    ) -> List[List[EdgeSample]]:
         search_scale = max(1.0, min(2.5, float(search_scale)))
-        fractions = np.linspace(0.08, 0.92, self.config.samples_per_side, dtype=np.float32)
-        predicted_outer = start.reshape(1, 2) + fractions.reshape(-1, 1) * side_vector.reshape(1, 2)
         expansion = search_scale - 1.0
-        outside = max(6.0, (0.70 + 0.90 * expansion) * tape_depth)
-        inside = max(14.0, (2.10 + 0.90 * expansion) * tape_depth)
+        fractions = np.linspace(
+            0.08,
+            0.92,
+            self.config.samples_per_side,
+            dtype=np.float32,
+        )
+        outside_values = [
+            max(6.0, (0.70 + 0.90 * expansion) * geometry.tape_depth)
+            for geometry in geometries
+        ]
+        inside_values = [
+            max(14.0, (2.10 + 0.90 * expansion) * geometry.tape_depth)
+            for geometry in geometries
+        ]
         offsets = np.arange(
-            -outside,
-            inside + self.config.profile_step_px,
+            -max(outside_values),
+            max(inside_values) + self.config.profile_step_px,
             self.config.profile_step_px,
             dtype=np.float32,
         )
+
+        predicted_by_side = [
+            geometry.start.reshape(1, 2)
+            + fractions.reshape(-1, 1) * geometry.vector.reshape(1, 2)
+            for geometry in geometries
+        ]
+        predicted_outer = np.vstack(predicted_by_side)
+        normals = np.vstack(
+            [
+                np.repeat(
+                    geometry.normal.reshape(1, 2),
+                    self.config.samples_per_side,
+                    axis=0,
+                )
+                for geometry in geometries
+            ]
+        )
         profile_points = (
             predicted_outer[:, None, :]
-            + offsets.reshape(1, -1, 1) * inward_normal.reshape(1, 1, 2)
-        )
-        valid_rows = (
-            np.all(profile_points[:, :, 0] >= 1.0, axis=1)
-            & np.all(profile_points[:, :, 1] >= 1.0, axis=1)
-            & np.all(profile_points[:, :, 0] < gray.shape[1] - 1.0, axis=1)
-            & np.all(profile_points[:, :, 1] < gray.shape[0] - 1.0, axis=1)
+            + offsets.reshape(1, -1, 1) * normals[:, None, :]
         )
         profiles = cv2.remap(
             gray,
@@ -178,10 +218,50 @@ class E25EdgeTracker:
             borderType=cv2.BORDER_REPLICATE,
         )
 
+        samples_by_side: List[List[EdgeSample]] = []
+        count = self.config.samples_per_side
+        for index, geometry in enumerate(geometries):
+            start = index * count
+            end = start + count
+            local_columns = (
+                (offsets >= -outside_values[index])
+                & (offsets <= inside_values[index])
+            )
+            local_points = profile_points[start:end, local_columns]
+            valid_rows = (
+                np.all(local_points[:, :, 0] >= 1.0, axis=1)
+                & np.all(local_points[:, :, 1] >= 1.0, axis=1)
+                & np.all(local_points[:, :, 0] < gray.shape[1] - 1.0, axis=1)
+                & np.all(local_points[:, :, 1] < gray.shape[0] - 1.0, axis=1)
+            )
+            samples_by_side.append(
+                self._samples_from_profiles(
+                    geometry,
+                    fractions,
+                    predicted_outer[start:end],
+                    profiles[start:end],
+                    offsets,
+                    valid_rows,
+                    expansion,
+                )
+            )
+        return samples_by_side
+
+    def _samples_from_profiles(
+        self,
+        geometry: _SideGeometry,
+        fractions: np.ndarray,
+        predicted_outer: np.ndarray,
+        profiles: np.ndarray,
+        offsets: np.ndarray,
+        valid_rows: np.ndarray,
+        expansion: float,
+    ) -> List[EdgeSample]:
+        tape_depth = geometry.tape_depth
         separation = max(2, int(round(0.18 * tape_depth)))
         if profiles.shape[1] <= separation + 4:
             return self._empty_samples(
-                side_index,
+                geometry.side,
                 fractions,
                 predicted_outer,
                 tape_depth,
@@ -194,7 +274,7 @@ class E25EdgeTracker:
         )
         if not np.any(valid_columns):
             return self._empty_samples(
-                side_index,
+                geometry.side,
                 fractions,
                 predicted_outer,
                 tape_depth,
@@ -230,7 +310,7 @@ class E25EdgeTracker:
         )
         measured_outer = predicted_outer + (
             (inner_depths - tape_depth).reshape(-1, 1)
-            * inward_normal.reshape(1, 2)
+            * geometry.normal.reshape(1, 2)
         )
 
         samples: List[EdgeSample] = []
@@ -239,7 +319,7 @@ class E25EdgeTracker:
             if not valid_rows[index]:
                 samples.append(
                     EdgeSample(
-                        side=side_index,
+                        side=geometry.side,
                         fraction=float(fraction),
                         point=(float(outer[0]), float(outer[1])),
                         score=0.0,
@@ -248,15 +328,13 @@ class E25EdgeTracker:
                 )
                 continue
             point = measured_outer[index]
-            score = float(scores[index])
-            inner_depth = float(inner_depths[index])
             samples.append(
                 EdgeSample(
-                    side=side_index,
+                    side=geometry.side,
                     fraction=float(fraction),
                     point=(float(point[0]), float(point[1])),
-                    score=float(score),
-                    inner_depth=float(inner_depth),
+                    score=float(scores[index]),
+                    inner_depth=float(inner_depths[index]),
                 )
             )
         return samples
@@ -278,49 +356,6 @@ class E25EdgeTracker:
             )
             for fraction, outer in zip(fractions, predicted_outer)
         ]
-
-    def _measure_profile(
-        self,
-        profile: np.ndarray,
-        offsets: np.ndarray,
-        predicted_outer: np.ndarray,
-        inward_normal: np.ndarray,
-        tape_depth: float,
-        search_scale: float,
-    ) -> Optional[Tuple[np.ndarray, float, float]]:
-        profile = np.convolve(
-            profile,
-            np.ones(5, dtype=np.float32) / 5.0,
-            mode="same",
-        )
-        separation = max(2, int(round(0.18 * tape_depth)))
-        if len(profile) <= separation + 4:
-            return None
-        contrast = profile[separation:] - profile[:-separation]
-        transition_offsets = 0.5 * (offsets[separation:] + offsets[:-separation])
-        expansion = search_scale - 1.0
-        valid = (
-            (transition_offsets >= (0.35 - 0.85 * expansion) * tape_depth)
-            & (transition_offsets <= (1.75 + 0.85 * expansion) * tape_depth)
-        )
-        if not np.any(valid):
-            return None
-        indices = np.flatnonzero(valid)
-        best_index = int(indices[np.argmax(contrast[valid])])
-        inner_depth = float(transition_offsets[best_index])
-        dark_index = best_index
-        bright_index = min(len(profile) - 1, best_index + separation)
-        dark = float(profile[dark_index])
-        bright = float(profile[bright_index])
-        delta = bright - dark
-        contrast_score = max(0.0, min(1.0, (delta - 5.0) / 48.0))
-        relative_score = max(0.0, min(1.0, (delta / max(bright, 40.0) - 0.05) / 0.32))
-        darkness_score = max(0.0, min(1.0, (bright - dark - 2.0) / 42.0))
-        depth_score = math.exp(-abs(inner_depth - tape_depth) / max(tape_depth, 2.0))
-        score = 0.55 * max(contrast_score, relative_score)
-        score += 0.20 * darkness_score + 0.25 * depth_score
-        measured_outer = predicted_outer + inward_normal * (inner_depth - tape_depth)
-        return measured_outer, max(0.0, min(1.0, score)), inner_depth
 
     def _fit_side(
         self,

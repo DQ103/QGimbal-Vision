@@ -14,11 +14,11 @@ GUI 模式按 'q' 或 ESC 退出；无窗口模式请按 Ctrl+C 退出。
 """
 
 import argparse
-from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import signal
 import subprocess
 import sys
 import threading
@@ -31,7 +31,6 @@ import numpy as np
 
 from vision.a4_target import (
     a4_center_mm,
-    A4Detection,
     A4TargetConfig,
     A4TargetTracker,
     detection_as_rect,
@@ -50,11 +49,8 @@ from vision.competition_vision import (
     stage_error,
 )
 from vision.e25_laser import E25LaserTracker
-from vision.e25_pipeline import (
-    E25GlobalDetectionContext,
-    E25PipelineConfig,
-    E25VisionPipeline,
-)
+from vision.e25_async_global import AsyncE25GlobalDetector
+from vision.e25_pipeline import E25PipelineConfig, E25VisionPipeline
 from vision.rect_detect import (
     DetectedRect,
     RectSelectionConfig,
@@ -1568,107 +1564,6 @@ def detect_with_scale(
     ]
 
 
-@dataclass(frozen=True)
-class E25GlobalDetectionResult:
-    frame_index: int
-    detections: Tuple[A4Detection, ...]
-    context: E25GlobalDetectionContext
-    elapsed_ms: float
-
-
-class AsyncE25GlobalDetector:
-    def __init__(
-        self,
-        tracker: E25VisionPipeline,
-        detect_scale: float,
-        multi_pass: bool,
-        max_area_ratio: float,
-        min_area_ratio: float,
-    ) -> None:
-        self.tracker = tracker
-        self.detect_scale = float(detect_scale)
-        self.multi_pass = bool(multi_pass)
-        self.max_area_ratio = float(max_area_ratio)
-        self.min_area_ratio = float(min_area_ratio)
-        self._condition = threading.Condition()
-        self._pending = None
-        self._result: Optional[E25GlobalDetectionResult] = None
-        self._result_id = -1
-        self._stopped = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def submit(
-        self,
-        frame: np.ndarray,
-        gray: np.ndarray,
-        frame_index: int,
-    ) -> None:
-        context = self.tracker.global_detection_context()
-        with self._condition:
-            self._pending = (
-                frame.copy(),
-                gray.copy(),
-                int(frame_index),
-                context,
-            )
-            self._condition.notify()
-
-    def latest(self, after_frame_index: int) -> Optional[E25GlobalDetectionResult]:
-        with self._condition:
-            if self._result is None or self._result_id <= after_frame_index:
-                return None
-            return self._result
-
-    def close(self) -> None:
-        with self._condition:
-            self._stopped = True
-            self._condition.notify_all()
-        self._thread.join(timeout=1.0)
-
-    def _run(self) -> None:
-        handled_frame = -1
-        while True:
-            with self._condition:
-                self._condition.wait_for(
-                    lambda: self._stopped
-                    or (
-                        self._pending is not None
-                        and self._pending[2] != handled_frame
-                    )
-                )
-                if self._stopped:
-                    return
-                frame, gray, frame_index, context = self._pending
-                handled_frame = frame_index
-
-            started = time.perf_counter()
-            base_rects = detect_with_scale(
-                gray,
-                self.detect_scale,
-                self.multi_pass,
-                self.max_area_ratio,
-                self.min_area_ratio,
-            )
-            black_rects = find_black_band_candidates(
-                gray,
-                context.candidate_config,
-            )
-            rects = merge_candidates(base_rects, black_rects, limit=12)
-            detections = self.tracker.detect_global(frame, rects, context)
-            result = E25GlobalDetectionResult(
-                frame_index=frame_index,
-                detections=tuple(detections),
-                context=context,
-                elapsed_ms=(time.perf_counter() - started) * 1000.0,
-            )
-            with self._condition:
-                if frame_index >= self._result_id:
-                    self._result = result
-                    self._result_id = frame_index
-                    self._condition.notify_all()
-
-
 def detect_candidates(
     args,
     raw_frame,
@@ -1703,15 +1598,30 @@ def detect_candidates(
     )
 
 
-def print_status(fps: float, best, ctrl_out, a4_result=None) -> None:
+def print_status(
+    fps: float,
+    best,
+    ctrl_out,
+    a4_result=None,
+    async_global_status: Optional[Tuple[float, int]] = None,
+) -> None:
     a4_text = ""
     if a4_result is not None:
         confidence = 0.0 if a4_result.detection is None else a4_result.detection.confidence
         label = "e25" if hasattr(a4_result, "confidence") else "a4"
         a4_text = (
             f" {label}={a4_result.state.value} conf={confidence:.2f} "
-            f"flow={a4_result.flow_inliers} miss={a4_result.miss_count}"
+            f"flow={a4_result.flow_inliers} miss={a4_result.miss_count} "
+            f"ms={a4_result.timing.total_ms:.1f}/"
+            f"{a4_result.timing.coarse_ms:.1f}/"
+            f"{a4_result.timing.edge_ms:.1f}/"
+            f"{a4_result.timing.validate_ms:.1f}"
         )
+        if async_global_status is not None:
+            a4_text += (
+                f" global={async_global_status[0]:.0f}ms/"
+                f"{async_global_status[1]}f"
+            )
     if best is None:
         print(f"fps={fps:.1f} rect=none rpm=({ctrl_out.yaw_rpm:.1f},{ctrl_out.pitch_rpm:.1f}){a4_text}")
     else:
@@ -1727,6 +1637,11 @@ def print_status(fps: float, best, ctrl_out, a4_result=None) -> None:
 
 def main():
     args = parse_args()
+
+    def request_shutdown(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, request_shutdown)
     width, height = parse_size(args.size)
     output_width, output_height = (
         parse_size(args.output_size) if args.output_size else (width, height)
@@ -1949,12 +1864,14 @@ def main():
     if e25_mode and bool(args.e25_async_global):
         e25_global_worker = AsyncE25GlobalDetector(
             e25_tracker,
+            frame_shape=(output_height, output_width, 3),
             detect_scale=float(args.detect_scale),
             multi_pass=bool(args.detect_multi_pass),
             max_area_ratio=float(args.rect_max_area_ratio),
             min_area_ratio=float(args.a4_min_area_ratio),
+            worker_threads=2,
         )
-        print('E25 async global detection enabled: latest-frame queue, main-loop tracking remains non-blocking')
+        print('E25 async global process enabled: shared-memory latest frame, main-loop tracking remains non-blocking')
 
     win_name = f"Camera {args.device if args.backend == 'gstreamer' else args.camera}"
     if display:
@@ -1970,6 +1887,7 @@ def main():
     capture_frame_id = 0
     last_e25_global_frame = -1
     last_e25_global_submit = 0.0
+    last_e25_global_status: Optional[Tuple[float, int]] = None
     frame_period = 1.0 / args.max_processing_fps if args.max_processing_fps > 0.0 else 0.0
     next_frame_deadline = time.monotonic()
 
@@ -2000,10 +1918,16 @@ def main():
                     if async_result is not None:
                         last_e25_global_frame = async_result.frame_index
                         result_age = frame_index - async_result.frame_index
+                        last_e25_global_status = (
+                            async_result.elapsed_ms,
+                            result_age,
+                        )
                         rings_match = (
-                            async_result.context.require_red_rings
+                            async_result.require_red_rings
                             == a4_settings.get_require_red_rings()
                         )
+                        if async_result.error:
+                            print(f'E25 global worker failed: {async_result.error}')
                         if result_age <= int(args.e25_global_max_age) and rings_match:
                             async_global_detections = async_result.detections
                             a4_detection_cycle = True
@@ -2235,7 +2159,13 @@ def main():
                 cv2.imshow(win_name, window_frame)
                 if args.print_in_display and (args.print_interval <= 0 or (now - last_print) >= args.print_interval):
                     last_print = now
-                    print_status(fps, best, ctrl_out, a4_result)
+                    print_status(
+                        fps,
+                        best,
+                        ctrl_out,
+                        a4_result,
+                        last_e25_global_status,
+                    )
                 key = cv2.waitKey(1) & 0xFF
                 # 按 'q' 或 ESC 退出
                 if key == ord('q') or key == 27:
@@ -2245,7 +2175,13 @@ def main():
                 # 无窗口：终端输出 FPS + 检测结果（按间隔打印，避免刷屏）
                 if args.print_interval <= 0 or (now - last_print) >= args.print_interval:
                     last_print = now
-                    print_status(fps, best, ctrl_out, a4_result)
+                    print_status(
+                        fps,
+                        best,
+                        ctrl_out,
+                        a4_result,
+                        last_e25_global_status,
+                    )
 
             if frame_period > 0.0:
                 next_frame_deadline += frame_period

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Tuple
 
@@ -31,6 +32,15 @@ class E25Confidence:
 
 
 @dataclass(frozen=True)
+class E25Timing:
+    total_ms: float
+    global_ms: float
+    coarse_ms: float
+    edge_ms: float
+    validate_ms: float
+
+
+@dataclass(frozen=True)
 class E25TrackResult:
     detection: Optional[A4Detection]
     state: A4TrackState
@@ -40,6 +50,7 @@ class E25TrackResult:
     flow_inliers: int
     confidence: E25Confidence
     edge_measurement: Optional[EdgeMeasurement]
+    timing: E25Timing
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,11 @@ class E25VisionPipeline:
         self.search_preview: Optional[A4Detection] = None
         self.miss_count = 0
         self.frame_count = 0
+        self._timing_started = 0.0
+        self._global_ms = 0.0
+        self._coarse_ms = 0.0
+        self._edge_ms = 0.0
+        self._validate_ms = 0.0
 
     def reset(self) -> None:
         self.state = A4TrackState.SEARCH
@@ -224,16 +240,23 @@ class E25VisionPipeline:
         global_detections: Optional[Sequence[A4Detection]] = None,
         defer_structural_validation: bool = False,
     ) -> E25TrackResult:
+        self._timing_started = time.perf_counter()
+        self._global_ms = 0.0
+        self._coarse_ms = 0.0
+        self._edge_ms = 0.0
+        self._validate_ms = 0.0
         self.frame_count += 1
         if self.current is not None:
             self.identity_age += 1
         detections: Sequence[A4Detection] = global_detections or ()
         if detection_cycle and global_detections is None:
+            global_started = time.perf_counter()
             detections = self.detect_global(
                 frame,
                 candidates,
                 self.global_detection_context(),
             )
+            self._global_ms = (time.perf_counter() - global_started) * 1000.0
 
         tracking_frame = gray_frame
         if tracking_frame is None:
@@ -252,7 +275,9 @@ class E25VisionPipeline:
         base = self.reliable or self.current
         if self.coarse_quad is None:
             self.coarse_quad = base.quad.copy()
+        coarse_started = time.perf_counter()
         coarse = self.coarse_motion.estimate(tracking_frame, self.coarse_quad)
+        self._coarse_ms = (time.perf_counter() - coarse_started) * 1000.0
         coarse_valid = (
             coarse.quad is not None
             and coarse.confidence >= self.config.coarse_min_confidence
@@ -309,6 +334,7 @@ class E25VisionPipeline:
             )
             self.identity_age = 0
 
+        edge_started = time.perf_counter()
         edge_measurement = self.edge_tracker.measure(
             tracking_frame,
             predicted_quad,
@@ -319,6 +345,7 @@ class E25VisionPipeline:
                 else 1.0
             ),
         )
+        self._edge_ms = (time.perf_counter() - edge_started) * 1000.0
         measurement_valid = (
             edge_measurement.quad is not None
             and edge_measurement.visible_sides >= 3
@@ -349,6 +376,7 @@ class E25VisionPipeline:
                 or self.frame_count % self.config.structural_validate_interval == 0
             )
             if validate_now and not defer_structural_validation:
+                validate_started = time.perf_counter()
                 validated = self.detector.evaluate(
                     frame,
                     measured.rect,
@@ -376,6 +404,9 @@ class E25VisionPipeline:
                 else:
                     validation_ok = False
                     self.identity_confidence *= 0.94
+                self._validate_ms = (
+                    time.perf_counter() - validate_started
+                ) * 1000.0
             else:
                 self.identity_confidence *= 0.998
 
@@ -493,6 +524,7 @@ class E25VisionPipeline:
                 False,
             ),
             edge_measurement=edge_measurement,
+            timing=self._timing(),
         )
         self.reset()
         return result
@@ -688,6 +720,19 @@ class E25VisionPipeline:
                 control_valid=bool(control_valid),
             ),
             edge_measurement=edge_measurement,
+            timing=self._timing(),
+        )
+
+    def _timing(self) -> E25Timing:
+        total_ms = 0.0
+        if self._timing_started > 0.0:
+            total_ms = (time.perf_counter() - self._timing_started) * 1000.0
+        return E25Timing(
+            total_ms=total_ms,
+            global_ms=self._global_ms,
+            coarse_ms=self._coarse_ms,
+            edge_ms=self._edge_ms,
+            validate_ms=self._validate_ms,
         )
 
 
