@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 
+SERIAL_ARGS=()
+if [[ -n "${SERIAL_PORT:-}" ]]; then
+  SERIAL_ARGS=(--serial-port "$SERIAL_PORT" --serial-baud "${SERIAL_BAUD:-115200}")
+fi
+
 # The Camera 4K overlay exposes full 4K through /dev/video1 with largemode=1,
 # but 1080p on /dev/video0 avoids the dual-stream ISP path and is appropriate
 # for real-time OpenCV rectangle detection.
@@ -30,4 +35,7 @@ exec python3 -u main.py \
   --stream-quality "${STREAM_QUALITY:-75}" \
   --print-interval "${PRINT_INTERVAL:-1}" \
   --control "${CONTROL:-0}" \
+  --invert-yaw "${INVERT_YAW:-1}" \
+  --invert-pitch "${INVERT_PITCH:-0}" \
+  "${SERIAL_ARGS[@]}" \
   "$@"

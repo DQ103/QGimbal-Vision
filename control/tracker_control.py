@@ -61,8 +61,8 @@ class GimbalTracker:
         # Lost target handling
         if target_center is None:
             if self._last_seen_ts > 0 and (now - self._last_seen_ts) <= self.cfg.lost_timeout_s:
-                # within grace period: keep trying with zero error (hold still).
-                return False,ControlOutput(0.0, 0.0, 0.0, 0.0)
+                # Stop immediately while retaining PID state for quick reacquisition.
+                return True,ControlOutput(0.0, 0.0, 0.0, 0.0)
             self.reset()
             return True,ControlOutput(0.0, 0.0, 0.0, 0.0)
 

@@ -218,10 +218,12 @@ COLOR_PRESETS = {
 }
 
 # 控制默认参数（可通过命令行覆盖）
-DEFAULT_CONTROL_ENABLED = 1
+DEFAULT_CONTROL_ENABLED = 0
 DEFAULT_MAX_RPM = 20.0
 DEFAULT_DEADBAND_PX = 0.0
 DEFAULT_LOST_TIMEOUT_S = 0.4
+DEFAULT_INVERT_YAW = 1
+DEFAULT_INVERT_PITCH = 0
 
 
 def parse_args():
@@ -371,10 +373,14 @@ def parse_args():
                    help=f'像素死区（默认 {DEFAULT_DEADBAND_PX}）')
     p.add_argument('--lost-timeout', type=float, default=DEFAULT_LOST_TIMEOUT_S,
                    help=f'丢目标超时后复位控制器的时间（秒，默认 {DEFAULT_LOST_TIMEOUT_S}）')
+    p.add_argument('--invert-yaw', type=int, choices=[0, 1], default=DEFAULT_INVERT_YAW,
+                   help=f'是否反转 yaw 输出方向（0/1，默认 {DEFAULT_INVERT_YAW}）')
+    p.add_argument('--invert-pitch', type=int, choices=[0, 1], default=DEFAULT_INVERT_PITCH,
+                   help=f'是否反转 pitch 输出方向（0/1，默认 {DEFAULT_INVERT_PITCH}）')
 
     # 串口相关（协议在 control/serial_stub.py 内实现）
     p.add_argument('--serial-port', type=str, default=None, help='串口端口号，例如 COM3；不填则不发送')
-    p.add_argument('--serial-baud', type=int, default=1152000, help='串口波特率（默认 1152000）')
+    p.add_argument('--serial-baud', type=int, default=115200, help='串口波特率（默认 115200）')
 
     return p.parse_args()
 
@@ -1760,10 +1766,22 @@ def main():
         lost_timeout_s=float(args.lost_timeout),
         max_rpm_yaw=float(args.max_rpm),
         max_rpm_pitch=float(args.max_rpm),
+        invert_yaw=bool(args.invert_yaw),
+        invert_pitch=bool(args.invert_pitch),
     )
     tracker = GimbalTracker(ctrl_cfg)
     serial = GimbalSerialStub(port=args.serial_port, baudrate=int(args.serial_baud))
-    serial.open()
+    serial_opened = serial.open()
+    if ctrl_cfg.enabled:
+        if args.serial_port is None:
+            ctrl_cfg.enabled = False
+            print('QGimbal control requested without --serial-port; control output disabled')
+        elif not serial_opened:
+            ctrl_cfg.enabled = False
+            print(f'QGimbal serial open failed; control output disabled: {serial.last_error}')
+        elif not serial.enable(wait_for_feedback=True):
+            ctrl_cfg.enabled = False
+            print(f'QGimbal enable failed; control output disabled: {serial.last_error or "no telemetry response"}')
     yolo_detector = None
     if args.detector in ('yolo', 'hybrid'):
         labels = set(args.yolo_label) if args.yolo_label else None
@@ -2065,8 +2083,15 @@ def main():
             else:
                 target_center = best.center if best is not None else None
             ret, ctrl_out = tracker.update(frame_w=w, frame_h=h, target_center=target_center, dt=max(dt, 1e-6), now=now)
-            if ret:
-                serial.send_rpm(ctrl_out.yaw_rpm, ctrl_out.pitch_rpm)
+            if ret and ctrl_cfg.enabled:
+                if not serial.send_rpm(ctrl_out.yaw_rpm, ctrl_out.pitch_rpm):
+                    serial.send_zero()
+                    ctrl_cfg.enabled = False
+                    print(f'QGimbal serial write failed; control output disabled: {serial.last_error}')
+                elif not serial.telemetry_is_fresh(max_age_s=0.5):
+                    serial.send_zero()
+                    ctrl_cfg.enabled = False
+                    print('QGimbal telemetry timeout; control output disabled')
 
             should_refresh_display = display and frame_index % int(args.display_every) == 0
             should_refresh_stream = streamer is not None and frame_index % int(args.stream_every) == 0

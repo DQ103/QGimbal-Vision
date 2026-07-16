@@ -203,7 +203,7 @@ python main.py --camera 0 --display 0 --print-interval 0.5
 
 - `control/pid.py`：基础 PID（积分限幅/输出限幅）
 - `control/tracker_control.py`：将图像误差映射为 `yaw_rpm/pitch_rpm`
-- `control/serial_stub.py`：串口发送 stub（目前 no-op，协议部分你后续补上）
+- `control/serial_stub.py`：QGimbal V1 串口适配器（10 字节命令、42 字节反馈、CRC8）
 
 ### 坐标系约定
 
@@ -213,10 +213,17 @@ python main.py --camera 0 --display 0 --print-interval 0.5
 
 ### 运行示例
 
-启用控制输出（默认已启用），并设置最大输出 rpm / 死区：
+指定串口并显式启用控制输出，设置最大输出 rpm / 死区：
 
 ```powershell
-python main.py --camera 0 --display 1 --control 1 --max-rpm 120 --deadband-px 6
+python main.py --camera 0 --display 1 --control 1 --serial-port /dev/ttyUSB0 --serial-baud 115200 --max-rpm 120 --deadband-px 6
+```
+
+Radxa 启动脚本也支持环境变量：
+
+```bash
+CONTROL=1 SERIAL_PORT=/dev/ttyUSB0 SERIAL_BAUD=115200 \
+INVERT_YAW=1 INVERT_PITCH=0 scripts/run_a7a_imx415_e25_web.sh
 ```
 
 无窗口模式查看控制输出：
@@ -225,4 +232,4 @@ python main.py --camera 0 --display 1 --control 1 --max-rpm 120 --deadband-px 6
 python main.py --camera 0 --display 0 --control 1 --print-interval 0.1
 ```
 
-> 注意：当前 `send_rpm()` 是空实现，不会实际控制云台。你把协议写好后，只需要替换 `control/serial_stub.py` 中的发送逻辑。
+> 安全默认值为 `--control 0`。启用后程序会先发送 Enable 并等待有效反馈；丢失目标会立即持续发送零速度，退出时发送零速度和 Disable。

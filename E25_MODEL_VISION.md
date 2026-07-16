@@ -128,8 +128,9 @@ occlusion, background distractors, warm glare, and moving laser.
 
 ## Control Contract
 
-The existing `GimbalSerialStub` still sends RPM packets to the STM32. E25 mode
-gates those packets with `control_valid` and changes to laser error after alignment.
+`GimbalSerialStub` implements the QGimbal V1 10-byte command and 42-byte feedback
+contract at 115200 baud. E25 mode gates nonzero RPM with `control_valid`, sends
+zero immediately when validity is lost, and changes to laser error after alignment.
 
 `control/e25_protocol.py` defines an optional ASCII telemetry packet for a future
 separate status channel:
