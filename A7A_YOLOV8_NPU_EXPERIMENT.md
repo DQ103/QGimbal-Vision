@@ -20,17 +20,19 @@ References:
   `/home/radxa/awnpu_model_zoo_v0.9`
 - Board official demo built at:
   `/home/radxa/awnpu_model_zoo/examples/yolov8/build_native/yolov8_demo_a733`
+- Board generated YOLOv8 A733 model:
+  `/home/radxa/awnpu_model_zoo/examples/yolov8/model/yolov8n_6_uint8_a733.nb`
 - Board YOLOv5 official demo built at:
   `/home/radxa/awnpu_model_zoo_v0.9/examples/yolov5/build_native/yolov5_demo_a733`
 - Board VIPLite runtime path:
   `/home/radxa/awnpu_model_zoo/common/npuruntime/lib_linux_aarch64/A733`
 - Board v0.9 VIPLite runtime path:
   `/home/radxa/awnpu_model_zoo_v0.9/common/npuruntime/lib_linux_aarch64/A733`
-- Missing artifact:
-  `examples/yolov8/model/yolov8n_6_uint8_a733.nb`
+- Generated model sha256:
+  `0e123bd4762b804c5cd54d287783d1294034581722987c5736b08464c0ca7a91`
 
-The YOLOv8 `.nb` file is not included in the downloaded model zoo archive. It
-must be generated with the A733 NPU conversion container.
+The YOLOv8 `.nb` file was not included in the downloaded model zoo archive. It
+was generated with the A733 NPU conversion container.
 
 The older `allwinner-model-zoo.tar.gz` v0.9 archive does include an A733 YOLOv5
 model:
@@ -73,30 +75,54 @@ NPU runtime are working.
 ## Generate The A733 Model
 
 On the x86 host, after the A733 container image is installed as
-`ubuntu-npu:v2.0.10.1`:
+`ubuntu-npu:v2.0.10.2`:
 
 ```bash
 cd /home/aki/cv/awnpu_model_zoo-v1.0.0-20260423-f562dd16
-sudo docker run --ipc=host -d -v "$PWD":/workspace --name model-zoo \
-  ubuntu-npu:v2.0.10.1 tail -f /dev/null
-sudo docker exec -it model-zoo /bin/bash
+docker run --ipc=host -d -v "$PWD":/workspace --name model-zoo-a733-yolov8 \
+  ubuntu-npu:v2.0.10.2 tail -f /dev/null
 ```
 
-Inside the container:
+The v1.0 archive has `yolov8n_6.onnx` directly under `convert_model/`, while
+the conversion scripts expect a model subdirectory. Prepare that layout:
 
 ```bash
 cd /workspace/examples/yolov8/convert_model
+mkdir -p yolov8n_6
+ln -sf ../yolov8n_6.onnx yolov8n_6/yolov8n_6.onnx
 ./convert_model_env.sh
-./pegasus_import.sh yolov8n_6
-./pegasus_quantize.sh yolov8n_6 uint8 12
-./pegasus_export_ovx_nbg.sh yolov8n_6 uint8 a733
-exit
 ```
 
-The output should be:
+For this archive, `config_yml.py` also needed the calibration dataset path
+changed from `../../dataset/coco_12/dataset.txt` to
+`../../../dataset/coco_12/dataset.txt`, because quantization runs inside
+`convert_model/yolov8n_6/`.
+
+Run the conversion:
+
+```bash
+docker exec -w /workspace/examples/yolov8/convert_model model-zoo-a733-yolov8 \
+  bash -lc 'export ACUITY_PATH=/root/acuity-toolkit-whl-6.30.22/bin;
+            export VIV_SDK=/root/Vivante_IDE/VivanteIDE5.11.0/cmdtools;
+            ./pegasus_import.sh yolov8n_6;
+            cd yolov8n_6 && python3 ../config_yml.py yolov8n_6 && cd ..;
+            ./pegasus_quantize.sh yolov8n_6 uint8 12;
+            mkdir -p model;
+            ./pegasus_export_ovx_nbg.sh yolov8n_6 uint8 a733'
+```
+
+The generated file appears at:
 
 ```text
-/home/aki/cv/awnpu_model_zoo-v1.0.0-20260423-f562dd16/examples/yolov8/model/yolov8n_6_uint8_a733.nb
+/home/aki/cv/awnpu_model_zoo-v1.0.0-20260423-f562dd16/examples/yolov8/convert_model/model/yolov8n_6_uint8_a733.nb
+```
+
+Copy it to the official demo model directory:
+
+```bash
+cp -f \
+  /home/aki/cv/awnpu_model_zoo-v1.0.0-20260423-f562dd16/examples/yolov8/convert_model/model/yolov8n_6_uint8_a733.nb \
+  /home/aki/cv/awnpu_model_zoo-v1.0.0-20260423-f562dd16/examples/yolov8/model/yolov8n_6_uint8_a733.nb
 ```
 
 ## Deploy The Model To A7A
@@ -115,27 +141,26 @@ cd /home/radxa/awnpu_model_zoo/examples/yolov8/build_native
 ./yolov8_demo_a733 -nb ../model/yolov8n_6_uint8_a733.nb -i ../model/dog.jpg
 ```
 
-Expected behavior: the demo prints `VIPLite driver software version`, NPU run
-time, and detection lines such as:
+Observed on A7A:
 
 ```text
-16:  95%, [ 131,  220,  308,  541], dog
+detection num: 3
+ 1:  89%, [ 130,  137,  568,  420], bicycle
+16:  96%, [ 131,  219,  308,  541], dog
+ 2:  62%, [ 467,   74,  694,  171], car
+VIPLite driver software version 2.0.3.2-AW-2024-08-30
+run time for this network 0: 12905 us.
 ```
 
 ## Run Through QGimbal-Vision
 
 The official demo is a one-shot CLI program and reloads the model every call.
-Use it only as a low-frequency experiment first.
+Use it only as a low-frequency experiment first. The deployed experiment branch
+is at `/home/radxa/QGimbal-Vision-p4-yolo-npu`.
 
 ```bash
-cd /tmp/QGimbal-Vision-p4-test
-python3 -u main.py --display 0 --size 1920x1080 --fps 30 --format NV12 \
-  --capture-mode raw --awisp 0 --largemode 0 --detect-scale 0.25 \
-  --detector hybrid --yolo-scale 0.33 --yolo-every 30 \
-  --yolo-timeout 3.0 --yolo-min-confidence 0.4 \
-  --yolo-command "python3 scripts/yolo_json_worker_cli_adapter.py --parser allwinner-yolo --timeout 3.0 --command \"env LD_LIBRARY_PATH=/home/radxa/awnpu_model_zoo/common/npuruntime/lib_linux_aarch64/A733 /home/radxa/awnpu_model_zoo/examples/yolov8/build_native/yolov8_demo_a733 -nb /home/radxa/awnpu_model_zoo/examples/yolov8/model/yolov8n_6_uint8_a733.nb -i {image}\"" \
-  --display-mode color --stream-port 8080 --stream-scale 0.33 \
-  --stream-every 8 --stream-quality 65 --print-interval 1
+cd /home/radxa/QGimbal-Vision-p4-yolo-npu
+./scripts/run_a7a_yolov8_hybrid.sh
 ```
 
 Open:
@@ -147,6 +172,16 @@ http://192.168.0.98:8080/
 If logs show `pass=100`, the selected target came from the YOLO branch.
 If the official COCO model does not detect the competition target, hybrid mode
 falls back to traditional rectangle detection.
+
+Observed live camera FPS with `YOLO_EVERY=30`, AWISP disabled, 1920x1080 NV12
+raw capture, color MJPEG preview enabled:
+
+```text
+fps=29.7
+fps=30.6
+fps=29.8
+fps=30.0
+```
 
 ## Final Performance Direction
 
