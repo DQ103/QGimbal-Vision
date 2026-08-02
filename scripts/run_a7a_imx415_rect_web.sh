@@ -9,19 +9,20 @@ if [[ -n "${SERIAL_PORT:-}" ]]; then
   SERIAL_ARGS=(--serial-port "$SERIAL_PORT" --serial-baud "${SERIAL_BAUD:-115200}")
 fi
 
-# The Camera 4K overlay exposes full 4K through /dev/video1 with largemode=1,
-# but 1080p on /dev/video0 avoids the dual-stream ISP path and is appropriate
-# for real-time OpenCV rectangle detection.
+# IMX415 exposes ISP scaler 4 as /dev/video4. Requesting 960x540 there keeps the
+# sensor/ISP at 1080p30 while avoiding single-core GStreamer scale/conversion.
+# OpenCV converts NV12 to the color frame required by E25 and laser detection.
 exec python3 -u main.py \
   --backend gstreamer \
-  --device "${DEVICE:-/dev/video0}" \
+  --device "${DEVICE:-/dev/video4}" \
   --set-subdev-format 0 \
-  --size "${SIZE:-1920x1080}" \
+  --size "${SIZE:-960x540}" \
   --output-size "${OUTPUT_SIZE:-960x540}" \
   --fps "${FPS:-30}" \
   --max-processing-fps "${MAX_PROCESSING_FPS:-30}" \
   --format NV12 \
-  --capture-mode "${CAPTURE_MODE:-bgr}" \
+  --capture-mode "${CAPTURE_MODE:-raw}" \
+  --raw-detect-color "${RAW_DETECT_COLOR:-1}" \
   --awisp 1 \
   --largemode 0 \
   --detector rect \

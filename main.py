@@ -251,6 +251,8 @@ def parse_args():
                    help=f'GStreamer v4l2src 输出格式（默认 {DEFAULT_FORMAT}，可试 NV12/RGB）')
     p.add_argument('--capture-mode', choices=['raw', 'bgr'], default=DEFAULT_CAPTURE_MODE,
                    help='raw 直接把 NV12 送入 OpenCV 并用 Y 平面检测；bgr 使用 videoconvert 转 BGR')
+    p.add_argument('--raw-detect-color', type=int, choices=[0, 1], default=0,
+                   help='raw/NV12 采集时在 OpenCV 中转 BGR 供识别使用（0/1，默认 0）')
     p.add_argument('--awisp', type=int, choices=[0, 1], default=DEFAULT_AWISP,
                    help=f'是否启用 AWISP（0/1，默认 {DEFAULT_AWISP}；1080p 稳定 30 FPS 建议 0）')
     p.add_argument('--largemode', type=int, choices=[0, 1], default=DEFAULT_LARGEMODE,
@@ -571,10 +573,13 @@ def extract_frame(frame, width: int, height: int, args):
         if frame.ndim != 2 or frame.shape[0] < nv12_height or frame.shape[1] < width:
             raise RuntimeError(f'期望 NV12 frame shape >= ({nv12_height}, {width})，实际为 {frame.shape}')
 
+        if args.raw_detect_color:
+            nv12 = frame[:nv12_height, :width]
+            bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+            return cv2.flip(bgr, -1) if flip else bgr
+
         gray = frame[:height, :width]
-        if flip:
-            gray = cv2.flip(gray, -1)
-        return gray
+        return cv2.flip(gray, -1) if flip else gray
 
     bgr = cv2.flip(frame, -1) if flip else frame
     return bgr
@@ -706,6 +711,19 @@ def make_competition_overlay(
 def make_display_frame(raw_frame, detect_frame, width: int, height: int, args, output_scale: float = 1.0):
     output_width, output_height = scaled_size(width, height, output_scale)
     if args.backend == 'gstreamer' and args.capture_mode == 'raw':
+        if detect_frame.ndim == 3:
+            display_frame = (
+                cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+                if args.display_mode == 'gray'
+                else detect_frame
+            )
+            if output_scale == 1.0:
+                return display_frame
+            return cv2.resize(
+                display_frame,
+                (output_width, output_height),
+                interpolation=cv2.INTER_AREA,
+            )
         if args.display_mode == 'gray':
             if output_scale == 1.0:
                 return detect_frame
